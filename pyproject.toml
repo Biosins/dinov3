@@ -1,3 +1,54 @@
+[project]
+name = "dinov3"
+dynamic = ["version"]
+readme = "README.md"
+requires-python = ">=3.11"
+license-files = ["LICENSE.md"]
+authors = [{ name = "Meta AI" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: Other/Proprietary License",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "ftfy>=6.3.1",
+    "iopath>=0.1.10",
+    "omegaconf>=2.4.0",
+    "pandas>=3.0.6",
+    "regex>=2026.9.29",
+    "scikit-learn>=1.9.1",
+    "scikit-learn-intelex>=2026.2.0",
+    "submitit>=1.5.4",
+    "termcolor>=3.3.0",
+    "torch>=2.14.1",
+    "torchmetrics>=1.9.0",
+    "torchvision>=0.29.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/facebookresearch/dinov3"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+version = { attr = "dinov3.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["dinov3*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml"]
+
+[tool.uv]
+# The environment only ever lives in the Linux devcontainer.
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
 [tool.mypy]
 python_version = "3.11"
 ignore_missing_imports = true
@@ -43,3 +94,11 @@ ignore = ["E203", "E501"]
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
 "hubconf.py" = ["F401"]
+
+[dependency-groups]
+dev = [
+    "docstr-coverage==2.3.2",
+    "mypy[reports]==1.17",
+    "pylint==3.3.8",
+    "ruff==0.12.8",
+]

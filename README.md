@@ -576,11 +576,12 @@ dinov3_vitl16_dinotxt_tet1280d20h24l, tokenizer = torch.hub.load(REPO_DIR, 'dino
 
 The training and evaluation code requires PyTorch version >= 2.7.1 as well as a few other 3rd party packages. Note that the code has only been tested with the specified versions and also expects a Linux environment. To setup all the required dependencies for training and evaluation, please follow the instructions below:
 
-*[micromamba](https://mamba.readthedocs.io/en/latest/user_guide/micromamba.html)* **(Recommended)** - Clone the repository and then create and activate a `dinov3` conda environment using the provided environment definition:
+*[Dev Container](https://containers.dev/)* **(Recommended)** - Clone the repository and open it in the provided dev container (e.g. VS Code: *Dev Containers: Reopen in Container*). The container needs an NVIDIA GPU exposed to Docker, and runs `uv sync` on creation.
+
+*[uv](https://docs.astral.sh/uv/)* - On a Linux machine, clone the repository and install all dependencies from the lockfile:
 
 ```shell
-micromamba env create -f conda.yaml
-micromamba activate dinov3
+uv sync
 ```
 
 ## Getting started
