@@ -7,11 +7,13 @@ grows linearly with the number of patches rather than quadratically.
 
 import math
 from dataclasses import dataclass
+from functools import partial
 from typing import Literal, NamedTuple
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.profiler import record_function
 
 from dinov3.layers.attention import SelfAttention, rope_apply
 from dinov3.layers.rope_position_encoding import RopePositionEmbedding
@@ -21,48 +23,91 @@ from dinov3.models.vision_transformer import DinoVisionTransformer
 @dataclass(frozen=True)
 class FoveationConfig:
     budget: int = 1024
-    """Most cells a head attends to, on top of the CLS and register tokens."""
+    """Keys each head attends to, including the CLS and register tokens. Slots the layout does not fill hold empty
+    null cells, so every head reads exactly this many keys; a multiple of 64 suits the attention kernels."""
     start_level: int = 2
     """Selection starts from cells 2**start_level patches wide (2 is 64px at 16px patches)."""
     score_level: int = 2
     """Scoring queries are mean-pooled over cells 2**score_level patches wide."""
-    order: Literal["per_level", "global"] = "per_level"
+    order: Literal["per_level", "global", "tree"] = "per_level"
     """per_level: one no-grad round per level, coarsest first, where cells only compete with cells of their own size.
-    global: `rounds` rounds, each ranking every splittable cell by its score per patch covered."""
-    score: Literal["attention", "detail", "random"] = "detail"
+    global: `rounds` rounds, each ranking every splittable cell by its score per patch covered.
+    tree: one scoring pass over all fine keys, then equal-slope allocation: each head splits exactly the cells whose
+    error reduction per added key beats its own threshold, set so its keys fit the budget."""
+    score: Literal["attention", "detail", "bound", "random"] = "detail"
     """attention: the attention mass a cell receives. detail: mass times the spread of the cell's patch values, a
-    rough estimate of the output error from leaving it unsplit. random: a baseline with the same budget."""
+    rough estimate of the output error from leaving it unsplit. bound: query norm x mass x key spread x value spread
+    / sqrt(d), a bound on the first-order output error (tree order only). random: a baseline with the same budget."""
     rounds: int = 3
     """Scoring rounds for global order."""
+    compile: bool = False
+    """Compile the per-layer pyramid pooling with torch.compile. Faster, but recompiles for every new image size."""
 
     def __post_init__(self):
         if not 0 <= self.score_level <= self.start_level:
             raise ValueError("score_level must lie between 0 and start_level")
+        if self.score == "bound" and self.order != "tree":
+            raise ValueError('score="bound" needs the one-pass scores of order="tree"')
 
 
-class RopeGrid(NamedTuple):
-    """What a foveated model's RoPE module returns: positions rather than rotations, because pooled cells
-    are rotated at their centroids."""
-
-    coords: Tensor  # [H, W, 2] patch centres in RoPE's [-1, 1] space
-    periods: Tensor  # [D_head // 4]
-
-
-class Pyramid(NamedTuple):
-    """All cells from fine (level 0) up to the start level in one flat buffer, plus a trailing empty null cell.
+class Layout(NamedTuple):
+    """Everything about the pyramid that depends only on the patch grid, so all layers share it: all cells from fine
+    (level 0) up to the start level in one flat index space, plus a trailing empty null cell.
 
     Padding cells and the null cell cover no patches, so their log-count bias is -inf and they get no attention.
     """
 
-    queries: Tensor  # [B, h, M, d] rotated at each cell's centroid
-    keys: Tensor  # [B, h, M, d] rotated at each cell's centroid
-    values: Tensor  # [B, h, M, d]
-    spread: Tensor  # [B, h, M] RMS distance of a cell's patch values from their mean
     counts: Tensor  # [M] patches each cell covers
     level: Tensor  # [M], -1 for the null cell
     children: Tensor  # [M, 4] a cell's quadrants; splitting a fine cell keeps it and adds three null cells
     roots: Tensor  # [n0] the start-level cells
     shapes: list[tuple[int, int]]  # grid size of each level, fine first; level l cells are 2**l patches wide
+    cell_rope: tuple[Tensor, Tensor]  # RoPE sin and cos [M, d] at each cell's centroid
+    patch_rope: tuple[Tensor, Tensor]  # RoPE sin and cos [H * W, d] at each patch centre
+
+    def level_cells(self, level: int) -> slice:
+        start = sum(h * w for h, w in self.shapes[:level])
+        return slice(start, start + self.shapes[level][0] * self.shapes[level][1])
+
+
+class RopeGrid(NamedTuple):
+    """What a foveated model's RoPE module returns: positions rather than rotations, because pooled cells
+    are rotated at their centroids. foveate() also precomputes the pyramid layout, once per forward pass."""
+
+    coords: Tensor  # [H, W, 2] patch centres in RoPE's [-1, 1] space
+    periods: Tensor  # [D_head // 4]
+    layout: Layout | None = None
+
+
+class Pyramid(NamedTuple):
+    """One layer's pooled features over a Layout."""
+
+    queries: Tensor  # [B, h, Q, d] queries pooled to the scoring level, rotated at each cell's centroid
+    query_counts: Tensor  # [Q] patches each scoring query stands for
+    keys: Tensor  # [B, h, M, d] rotated at each cell's centroid
+    values: Tensor  # [B, h, M, d]
+    spread: Tensor  # [B, h, M] RMS distance of a cell's patch values from their mean
+    layout: Layout
+
+    @property
+    def counts(self) -> Tensor:
+        return self.layout.counts
+
+    @property
+    def level(self) -> Tensor:
+        return self.layout.level
+
+    @property
+    def children(self) -> Tensor:
+        return self.layout.children
+
+    @property
+    def roots(self) -> Tensor:
+        return self.layout.roots
+
+    @property
+    def shapes(self) -> list[tuple[int, int]]:
+        return self.layout.shapes
 
 
 def patch_coords(rope: RopePositionEmbedding, H: int, W: int) -> Tensor:
@@ -74,10 +119,20 @@ def patch_coords(rope: RopePositionEmbedding, H: int, W: int) -> Tensor:
     return 2.0 * torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"), dim=-1) - 1.0
 
 
+def rope_sincos(coords: Tensor, periods: Tensor) -> tuple[Tensor, Tensor]:
+    """RoPE sin and cos [..., D_head] at positions coords [..., 2], exactly as RopePositionEmbedding computes them."""
+    angles = (2 * math.pi * coords[..., None] / periods).flatten(-2).tile(2)
+    return angles.sin(), angles.cos()
+
+
+def _rotate(x: Tensor, sincos: tuple[Tensor, Tensor]) -> Tensor:
+    sin, cos = sincos
+    return rope_apply(x.to(sin.dtype), sin, cos).to(x.dtype)
+
+
 def rope_rotate(x: Tensor, coords: Tensor, periods: Tensor) -> Tensor:
     """Rotates x [..., D_head] at positions coords [..., 2], exactly as RopePositionEmbedding and rope_apply do."""
-    angles = (2 * math.pi * coords[..., None] / periods).flatten(-2).tile(2)
-    return rope_apply(x.to(angles.dtype), angles.sin(), angles.cos()).to(x.dtype)
+    return _rotate(x, rope_sincos(coords, periods))
 
 
 def rope_patches(x: Tensor, grid: RopeGrid) -> Tensor:
@@ -93,27 +148,21 @@ def _sum_pool(x: Tensor) -> Tensor:
     return x.unflatten(-3, (H // 2, 2)).unflatten(-2, (W // 2, 2)).sum((-4, -2))
 
 
-def build_pyramid(q: Tensor, k: Tensor, v: Tensor, grid: RopeGrid, levels: int) -> Pyramid:
-    """Mean-pools patch queries, keys and values [B, h, H, W, d] into a quadtree `levels` levels deep."""
-    side = 2**levels
-    H, W = grid.coords.shape[:2]
-    pad = (0, 0, 0, -W % side, 0, -H % side)  # pads H and W up to multiples of side
-    ones = torch.ones_like(grid.coords[..., :1])
-    d = v.shape[-1]
-    sums = [F.pad(torch.cat([q, k, v, v.square().sum(-1, keepdim=True)], dim=-1), pad)]
-    geo_sums = [F.pad(torch.cat([grid.coords, ones], dim=-1), pad)]  # coordinate sums and patch counts
-    for _ in range(levels):
-        sums.append(_sum_pool(sums[-1]))
-        geo_sums.append(_sum_pool(geo_sums[-1]))
+def _pad_to(side: int, H: int, W: int) -> tuple[int, ...]:
+    """F.pad widths that pad [..., H, W, c] up to multiples of side."""
+    return (0, 0, 0, -W % side, 0, -H % side)
 
-    null_cell = (0, 0, 0, 1)
-    flat = F.pad(torch.cat([s.flatten(-3, -2) for s in sums], dim=-2), null_cell)
-    geo = F.pad(torch.cat([s.flatten(0, 1) for s in geo_sums]), null_cell)
+
+def pyramid_layout(grid: RopeGrid, levels: int) -> Layout:
+    """The quadtree over grid's patches, `levels` levels deep."""
+    H, W = grid.coords.shape[:2]
+    ones = torch.ones_like(grid.coords[..., :1])
+    geo_sums = [F.pad(torch.cat([grid.coords, ones], dim=-1), _pad_to(2**levels, H, W))]
+    for _ in range(levels):
+        geo_sums.append(_sum_pool(geo_sums[-1]))  # coordinate sums and patch counts
+    geo = F.pad(torch.cat([s.flatten(0, 1) for s in geo_sums]), (0, 0, 0, 1))  # plus the null cell
     counts = geo[:, 2]
-    divisor = counts.clamp(min=1)[:, None]
-    coords = geo[:, :2] / divisor
-    queries, keys, values, value_sq = (flat / divisor.to(flat.dtype)).split([d, d, d, 1], dim=-1)
-    spread = (value_sq[..., 0] - values.square().sum(-1)).clamp(min=0).sqrt()
+    coords = geo[:, :2] / counts.clamp(min=1)[:, None]
 
     shapes = [tuple(s.shape[:2]) for s in geo_sums]
     null = len(counts) - 1
@@ -123,19 +172,68 @@ def build_pyramid(q: Tensor, k: Tensor, v: Tensor, grid: RopeGrid, levels: int) 
     # The children of each level-l cell are a 2x2 block of the level l-1 grid.
     quadrants = [g.unflatten(0, (-1, 2)).unflatten(2, (-1, 2)).transpose(1, 2).reshape(-1, 4) for g in grids[:-1]]
     leaf_children = F.pad(grids[0].reshape(-1, 1), (0, 3), value=null)
-    children = torch.cat([leaf_children, *quadrants, torch.full_like(leaf_children[:1], null)])
-
-    return Pyramid(
-        queries=rope_rotate(queries, coords, grid.periods),
-        keys=rope_rotate(keys, coords, grid.periods),
-        values=values,
-        spread=spread,
+    return Layout(
         counts=counts,
         level=level,
-        children=children,
+        children=torch.cat([leaf_children, *quadrants, torch.full_like(leaf_children[:1], null)]),
         roots=flat_ids[-1],
         shapes=shapes,
+        cell_rope=rope_sincos(coords, grid.periods),
+        patch_rope=rope_sincos(grid.coords.flatten(0, 1), grid.periods),
     )
+
+
+def cell_sums(x: Tensor, levels: int) -> Tensor:
+    """Sums per-patch features x [..., H, W, c] over every cell of a `levels`-deep pyramid, giving [..., M, c] in
+    Layout order: fine cells first, the null cell last."""
+    H, W = x.shape[-3:-1]
+    sums = [F.pad(x, _pad_to(2**levels, H, W))]
+    for _ in range(levels):
+        sums.append(_sum_pool(sums[-1]))
+    return F.pad(torch.cat([s.flatten(-3, -2) for s in sums], dim=-2), (0, 0, 0, 1))
+
+
+def _pool_features(
+    q: Tensor, k: Tensor, v: Tensor, layout: Layout, levels: int, score_level: int
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Scoring queries pooled to score_level, plus keys, values and value spread pooled to every level, from patch
+    q, k, v [B, h, H, W, d]. Queries and keys come out rotated at their cells' centroids."""
+    H, W, d = k.shape[2], k.shape[3], k.shape[-1]
+    pad = _pad_to(2**levels, H, W)
+    divisor = layout.counts.clamp(min=1)[:, None].to(k.dtype)
+    flat = cell_sums(torch.cat([k, v, v.square().sum(-1, keepdim=True)], dim=-1), levels)
+    keys, values, value_sq = (flat / divisor).split([d, d, 1], dim=-1)
+    spread = (value_sq[..., 0] - values.square().sum(-1)).clamp(min=0).sqrt()
+
+    queries = F.pad(q, pad)
+    for _ in range(score_level):
+        queries = _sum_pool(queries)
+    score_cells = layout.level_cells(score_level)
+    queries = queries.flatten(-3, -2) / divisor[score_cells]
+    score_rope = (layout.cell_rope[0][score_cells], layout.cell_rope[1][score_cells])
+    return _rotate(queries, score_rope), _rotate(keys, layout.cell_rope), values, spread
+
+
+_pool_features_compiled = torch.compile(_pool_features)
+
+
+def build_pyramid(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    grid: RopeGrid,
+    levels: int,
+    score_level: int | None = None,
+    compile: bool = False,
+) -> Pyramid:
+    """Mean-pools patch keys and values [B, h, H, W, d] into a quadtree `levels` levels deep, and queries to
+    `score_level` (default: `levels`). Uses grid's precomputed layout when it has one."""
+    score_level = levels if score_level is None else score_level
+    layout = grid.layout if grid.layout is not None else pyramid_layout(grid, levels)
+    assert len(layout.shapes) == levels + 1, "the grid's layout was built for a different start level"
+    pool = _pool_features_compiled if compile else _pool_features
+    queries, keys, values, spread = pool(q, k, v, layout, levels, score_level)
+    return Pyramid(queries, layout.counts[layout.level_cells(score_level)], keys, values, spread, layout)
 
 
 def _spare_splits(roots: int, budget: int) -> int:
@@ -181,11 +279,15 @@ def gather_cells(x: Tensor, cells: Tensor) -> Tensor:
 def select_cells(
     pyramid: Pyramid, queries: Tensor, weights: Tensor, prefix_keys: Tensor, config: FoveationConfig
 ) -> Tensor:
-    """Indices [B, h, n] of the cells each head attends to; together they tile the image exactly once.
+    """Indices [B, h, budget - prefix] of the cells each head attends to; together they tile the image exactly once,
+    and any slots left over hold null cells, so with the CLS and register tokens every head reads exactly `budget`
+    keys.
 
     Each round, `queries` [B, h, Q, d], each standing in for `weights` [Q] fine queries, attend to the CLS and
     register tokens plus the current cells, which are then scored (see FoveationConfig.score) and the best split.
     """
+    n_slots = config.budget - prefix_keys.shape[2]
+    null = len(pyramid.counts) - 1
 
     def scores(cells: Tensor) -> Tensor:
         n_prefix = prefix_keys.shape[2]
@@ -199,18 +301,23 @@ def select_cells(
             return mass * pyramid.spread.gather(-1, cells)
         return mass
 
+    if config.order == "tree":
+        errors = cell_errors(pyramid, queries, weights, prefix_keys, config.score)
+        return _select_tree(pyramid, errors, n_slots)
     roots = pyramid.roots.expand(*queries.shape[:2], -1)
     if config.order == "global":
-        return _select_global(pyramid, roots, scores, config)
-    return _select_per_level(pyramid, roots, scores, config)
+        cells = _select_global(pyramid, roots, scores, n_slots, config.rounds)
+    else:
+        cells = _select_per_level(pyramid, roots, scores, n_slots)
+    return F.pad(cells, (0, n_slots - cells.shape[-1]), value=null)
 
 
-def _select_per_level(pyramid: Pyramid, roots: Tensor, scores, config: FoveationConfig) -> Tensor:
+def _select_per_level(pyramid: Pyramid, roots: Tensor, scores, n_slots: int) -> Tensor:
     """Coarsest level first, so cells only compete with cells of the same size: at each level the frontier of cells
     the level above created is scored alongside the settled cells, its best cells split into the next frontier, and
     the rest settle."""
     settled, frontier = roots[..., :0], roots
-    for splits in level_schedule(roots.shape[-1], config.budget, config.start_level):
+    for splits in level_schedule(roots.shape[-1], n_slots, len(pyramid.shapes) - 1):
         if not splits:
             break
         frontier_scores = scores(torch.cat([settled, frontier], dim=-1))[..., settled.shape[-1] :]
@@ -220,11 +327,11 @@ def _select_per_level(pyramid: Pyramid, roots: Tensor, scores, config: Foveation
     return torch.cat([settled, frontier], dim=-1)
 
 
-def _select_global(pyramid: Pyramid, roots: Tensor, scores, config: FoveationConfig) -> Tensor:
+def _select_global(pyramid: Pyramid, roots: Tensor, scores, n_slots: int, rounds: int) -> Tensor:
     """Every round ranks all splittable cells together by score per patch, so cells of different sizes compete on
     equal terms. If a round runs out of splittable cells, it splits fine cells into themselves plus null cells."""
     cells = roots
-    for splits in round_schedule(roots.shape[-1], config.budget, config.rounds):
+    for splits in round_schedule(roots.shape[-1], n_slots, rounds):
         if not splits:
             break
         per_patch = scores(cells) / pyramid.counts[cells].clamp(min=1)
@@ -233,6 +340,107 @@ def _select_global(pyramid: Pyramid, roots: Tensor, scores, config: FoveationCon
         quads = pyramid.children[cells.gather(-1, picked)]
         cells = torch.cat([cells.scatter(-1, picked, quads[..., 0]), quads[..., 1:].flatten(-2)], dim=-1)
     return cells
+
+
+def cell_errors(
+    pyramid: Pyramid, queries: Tensor, weights: Tensor, prefix_keys: Tensor, score: str, chunk: int = 128
+) -> Tensor:
+    """Estimated output error [B, h, M] from leaving each cell pooled, for every cell at once.
+
+    The scoring queries attend once to the CLS and register tokens plus every fine key; each patch's attention (and
+    its query-norm-weighted attention) is then summed up the pyramid, so a cell's mass is the sum of its children's.
+    """
+    layout, d, n_prefix = pyramid.layout, queries.shape[-1], prefix_keys.shape[2]
+    fine = layout.level_cells(0)
+    fine_keys = pyramid.keys[:, :, fine]  # rotated; padding patches are masked by their -inf bias
+    keys = torch.cat([prefix_keys, fine_keys], dim=2)
+    bias = F.pad(layout.counts[fine].log(), (n_prefix, 0))
+    stats = torch.stack([weights.expand(queries.shape[:3]), weights * queries.norm(dim=-1)], dim=-1)  # [B, h, Q, 2]
+    per_patch = 0
+    for rows in torch.arange(queries.shape[2], device=queries.device).split(chunk):
+        probs = (queries[:, :, rows] @ keys.mT * d**-0.5 + bias).softmax(-1)[..., n_prefix:]
+        per_patch = per_patch + probs.mT @ stats[:, :, rows].to(probs.dtype)  # [B, h, N', 2]
+    features = torch.cat([per_patch, fine_keys, fine_keys.square().sum(-1, keepdim=True)], dim=-1)
+    mass, q_mass, k_sum, k_sq = cell_sums(features.unflatten(2, layout.shapes[0]), len(layout.shapes) - 1).split(
+        [1, 1, d, 1], dim=-1
+    )
+    n = layout.counts.clamp(min=1)[:, None]
+    key_spread = (k_sq / n - (k_sum / n).square().sum(-1, keepdim=True)).clamp(min=0).sqrt()[..., 0]
+    errors = dict(
+        attention=lambda: mass[..., 0],
+        detail=lambda: mass[..., 0] * pyramid.spread,
+        bound=lambda: q_mass[..., 0] * key_spread * pyramid.spread * d**-0.5,
+        random=lambda: torch.rand_like(mass[..., 0]),
+    )
+    return errors[score]()
+
+
+def _select_tree(pyramid: Pyramid, errors: Tensor, n_slots: int, iterations: int = 32) -> Tensor:
+    """Equal-slope allocation: with a per-head price per key, the cheapest tiling keeps a cell pooled when its error
+    plus one key's price beats the best tiling of its children. Each head's price is found by bisection so its keys
+    fit the n_slots budget. Key counts jump as the price moves, so the bisection can land a few splits short; those
+    slots are filled greedily with the splits that remove the most estimated error per added key. A split adds one
+    key per real child minus one, so splits on the image edge, whose other children are padding, add fewer. At most
+    two slots stay empty unless a head runs out of cells worth splitting. Empty slots hold null cells, so shapes stay
+    static."""
+    layout = pyramid.layout
+    levels, null = len(layout.shapes) - 1, len(layout.counts) - 1
+    _spare_splits(len(layout.roots), n_slots)  # checks the start cells fit
+    by_level = [layout.level_cells(level) for level in range(levels + 1)]
+    real = [(layout.counts[cells] > 0).view(layout.shapes[level]) for level, cells in enumerate(by_level)]
+    error = [errors[..., cells].unflatten(-1, layout.shapes[level]) for level, cells in enumerate(by_level)]
+
+    def quad_sum(x: Tensor) -> Tensor:
+        return _sum_pool(x[..., None])[..., 0]
+
+    def tile(price: Tensor) -> tuple[list[Tensor], Tensor]:
+        """Which cells to split at this price [B, h], and how many keys the cheapest tiling uses."""
+        price = price[..., None, None]
+        cost, keys, splits = real[0] * price, real[0].to(price.dtype), [None]
+        for level in range(1, levels + 1):
+            keep_cost = (error[level] + price) * real[level]
+            split = (quad_sum(cost) < keep_cost) & real[level]
+            cost = torch.where(split, quad_sum(cost), keep_cost)
+            keys = torch.where(split, quad_sum(keys), real[level].to(keys.dtype))
+            splits.append(split)
+        return splits, keys.sum((-2, -1))
+
+    low = torch.zeros(errors.shape[:2], device=errors.device, dtype=errors.dtype)
+    high = errors.amax(-1) + 1
+    for _ in range(iterations):
+        mid = (low + high) / 2
+        fits = tile(mid)[1] <= n_slots
+        high, low = torch.where(fits, mid, high), torch.where(fits, low, mid)
+    splits, _ = tile(high)
+
+    chosen, reached = [], real[levels].expand(splits[levels].shape)
+    for level in range(levels, 0, -1):
+        chosen.append(reached & ~splits[level])
+        reached = (reached & splits[level]).repeat_interleave(2, -2).repeat_interleave(2, -1) & real[level - 1]
+    chosen.append(reached)
+    chosen = F.pad(torch.cat([c.flatten(-2) for c in reversed(chosen)], dim=-1), (0, 1))  # Layout order, null last
+
+    # Greedy fill: split the chosen cells that remove the most error per added key, while the slots last.
+    gain = [error[level] - quad_sum(error[level - 1] * real[level - 1]) for level in range(1, levels + 1)]
+    n_fine = by_level[0].stop - by_level[0].start
+    gain = F.pad(torch.cat([g.flatten(-2) for g in gain], dim=-1), (n_fine, 1), value=-math.inf)  # fine, null: never
+    added = (layout.counts[layout.children] > 0).sum(-1) - 1  # [M] keys a split adds; 0 if one child is real
+    for _ in range(3):  # each pass skips splits bigger than the room left, so smaller edge splits still fit
+        room = n_slots - chosen.sum(-1, keepdim=True)
+        fits = chosen & (added > 0) & (added <= room)
+        per_key = (gain / added.clamp(min=1)).masked_fill(~fits, -math.inf)
+        ranked = per_key.argsort(dim=-1, descending=True)
+        worth = per_key.gather(-1, ranked).isfinite()
+        take = worth & ((added[ranked] * worth).cumsum(-1) <= room)
+        picked = torch.where(take, ranked, null)
+        kids = layout.children[picked]  # [B, h, M, 4]
+        kids = torch.where(take[..., None] & (layout.counts[kids] > 0), kids, null)
+        chosen = chosen.scatter(-1, picked, False).scatter(-1, kids.flatten(-2), True)
+        chosen[..., null] = False
+
+    order = (~chosen).to(torch.int8).argsort(dim=-1, stable=True)[..., :n_slots]  # chosen cells first
+    used = torch.arange(n_slots, device=errors.device) < chosen.sum(-1, keepdim=True)
+    return torch.where(used, order, null)
 
 
 class FoveatedAttention(nn.Module):
@@ -261,29 +469,35 @@ class FoveatedAttention(nn.Module):
         (q_prefix, q_patches), (k_prefix, k_patches), (_, v_patches) = (
             t.split([n_prefix, H * W], dim=2) for t in (q, k, v)
         )
-        pyramid = build_pyramid(
-            *(t.unflatten(2, (H, W)) for t in (q_patches, k_patches, v_patches)), grid, self.config.start_level
-        )
-        scorers = pyramid.level == self.config.score_level
-        cells = select_cells(
-            pyramid,
-            queries=torch.cat([q_prefix, pyramid.queries[:, :, scorers]], dim=2),
-            weights=F.pad(pyramid.counts[scorers], (n_prefix, 0), value=1.0),
-            prefix_keys=k_prefix,
-            config=self.config,
-        )
-        keys = torch.cat([k_prefix, gather_cells(pyramid.keys, cells)], dim=2)
-        values = torch.cat([v[:, :, :n_prefix], gather_cells(pyramid.values, cells)], dim=2)
-        # A cell covering m patches stands in for m keys, so it gets log(m) added to its logits.
-        log_counts = F.pad(pyramid.counts.log()[cells], (n_prefix, 0))
-        out = F.scaled_dot_product_attention(
-            rope_patches(q, grid), keys, values, attn_mask=log_counts[:, :, None].to(q.dtype)
-        )
+        with record_function("foveation.pyramid"):
+            pyramid = build_pyramid(
+                *(t.unflatten(2, (H, W)) for t in (q_patches, k_patches, v_patches)),
+                grid,
+                self.config.start_level,
+                self.config.score_level,
+                self.config.compile,
+            )
+        with record_function("foveation.select"):
+            cells = select_cells(
+                pyramid,
+                queries=torch.cat([q_prefix, pyramid.queries], dim=2),
+                weights=F.pad(pyramid.query_counts, (n_prefix, 0), value=1.0),
+                prefix_keys=k_prefix,
+                config=self.config,
+            )
+        with record_function("foveation.attend"):
+            keys = torch.cat([k_prefix, gather_cells(pyramid.keys, cells)], dim=2)
+            values = torch.cat([v[:, :, :n_prefix], gather_cells(pyramid.values, cells)], dim=2)
+            # A cell covering m patches stands in for m keys, so it gets log(m) added to its logits.
+            log_counts = F.pad(pyramid.counts.log()[cells], (n_prefix, 0))
+            queries = torch.cat([q_prefix, _rotate(q_patches, pyramid.layout.patch_rope)], dim=2)
+            out = F.scaled_dot_product_attention(queries, keys, values, attn_mask=log_counts[:, :, None].to(q.dtype))
         return out, cells, pyramid
 
 
-def _rope_grid(rope: RopePositionEmbedding, args, kwargs, output) -> RopeGrid:
-    return RopeGrid(patch_coords(rope, kwargs["H"], kwargs["W"]), rope.periods)
+def _rope_grid(rope: RopePositionEmbedding, args, kwargs, output, levels: int) -> RopeGrid:
+    grid = RopeGrid(patch_coords(rope, kwargs["H"], kwargs["W"]), rope.periods)
+    return grid._replace(layout=pyramid_layout(grid, levels))
 
 
 def foveate(model: DinoVisionTransformer, config: FoveationConfig) -> DinoVisionTransformer:
@@ -293,5 +507,5 @@ def foveate(model: DinoVisionTransformer, config: FoveationConfig) -> DinoVision
         raise ValueError("Build the model with drop_path_rate=0 before foveating it")
     for block in model.blocks:
         block.attn = FoveatedAttention(block.attn, config)
-    model.rope_embed.register_forward_hook(_rope_grid, with_kwargs=True)
+    model.rope_embed.register_forward_hook(partial(_rope_grid, levels=config.start_level), with_kwargs=True)
     return model

@@ -133,12 +133,12 @@ def measure(model: DinoVisionTransformer, image: Tensor, configs: list[Foveation
     return rows
 
 
-def feasible_configs(H: int, W: int, args) -> list[FoveationConfig]:
+def feasible_configs(H: int, W: int, n_prefix: int, args) -> list[FoveationConfig]:
     configs = []
     for start_level, budget in itertools.product(args.start_levels, args.budgets):
         side = 2**start_level
         roots = -(-H // side) * -(-W // side)
-        if roots > budget:
+        if roots > budget - n_prefix:
             logger.warning(
                 f"Skipping budget {budget} at start level {start_level}: {H}x{W} patches give {roots} start cells"
             )
@@ -172,7 +172,7 @@ def main():
             image = resize_image(path, size, model.patch_size).to(device)
             H, W = (side // model.patch_size for side in image.shape[-2:])
             logger.info(f"{path.name} at {size}px: {H}x{W} patches")
-            if not (configs := feasible_configs(H, W, args)):
+            if not (configs := feasible_configs(H, W, 1 + model.n_storage_tokens, args)):
                 continue
             for row in measure(model, image, configs, args.chunk):
                 rows.append(dict(image=path.name, size=size, patches_h=H, patches_w=W) | row)

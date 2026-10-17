@@ -57,18 +57,18 @@ def compare(dense: tuple, foveated: tuple, n_prefix: int) -> list[dict]:
     return rows
 
 
-def layouts(budgets: list[int], start_level: int, roots: int) -> dict[str, FoveationConfig]:
+def layouts(budgets: list[int], start_level: int, roots: int, n_prefix: int) -> dict[str, FoveationConfig]:
     configs = {
-        f"uniform {16 * 2**start_level}px (K={roots})": FoveationConfig(
-            budget=roots, start_level=start_level, score_level=start_level
+        f"uniform {16 * 2**start_level}px (K={roots + n_prefix})": FoveationConfig(
+            budget=roots + n_prefix, start_level=start_level, score_level=start_level
         )
     }
     for budget in budgets:
         for order, score in [
             ("per_level", "attention"),
-            ("global", "attention"),
             ("per_level", "detail"),
-            ("global", "detail"),
+            ("tree", "detail"),
+            ("tree", "bound"),
             ("per_level", "random"),
         ]:
             configs[f"{order} {score} K={budget}"] = FoveationConfig(
@@ -101,7 +101,9 @@ def main():
             H, W = (s // dense.patch_size for s in image.shape[-2:])
             logger.info(f"{path.name}: {H}x{W} patches")
             reference = features(dense, image)
-            for name, config in layouts(args.budgets, args.start_level, -(-H // side) * -(-W // side)).items():
+            for name, config in layouts(
+                args.budgets, args.start_level, -(-H // side) * -(-W // side), n_prefix
+            ).items():
                 torch.manual_seed(args.seed)
                 foveated = foveate(copy.deepcopy(dense), config)
                 for row in compare(reference, features(foveated, image), n_prefix):

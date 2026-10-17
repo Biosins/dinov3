@@ -52,11 +52,11 @@ def test_rope_rotate_matches_rope_embedding(normalize):
     torch.testing.assert_close(rope_rotate(x, patch_coords(rope, 6, 10).flatten(0, 1), rope.periods), expected)
 
 
-@pytest.mark.parametrize("order", ["per_level", "global"])
+@pytest.mark.parametrize("order", ["per_level", "global", "tree"])
 @pytest.mark.parametrize("H, W", [(8, 8), (6, 10)])  # 6x10 exercises the padding
 def test_full_budget_reproduces_dense_layer(layer, H, W, order):
     attn, rope = layer
-    config = FoveationConfig(budget=padded_patches(H, W, 2), start_level=2, score_level=1, order=order)
+    config = FoveationConfig(budget=padded_patches(H, W, 2) + PREFIX, start_level=2, score_level=1, order=order)
     x = torch.randn(2, PREFIX + H * W, DIM)
     expected = attn(x, rope=rope(H=H, W=W))
     actual = FoveatedAttention(attn, config)(x, rope=RopeGrid(patch_coords(rope, H, W), rope.periods))
@@ -74,23 +74,31 @@ def test_log_count_bonus_makes_uniform_cells_exact(layer):
     k[:, :, PREFIX:], v[:, :, PREFIX:] = (
         t.repeat_interleave(4, 2).repeat_interleave(4, 3)[:, :, :H, :W].flatten(2, 3) for t in (cell_k, cell_v)
     )
-    fov = FoveatedAttention(attn, FoveationConfig(budget=6, start_level=2))
+    fov = FoveatedAttention(attn, FoveationConfig(budget=6 + PREFIX, start_level=2))
     out, cells, _ = fov.attend(q, k, v, no_rotation)
     assert cells.shape[-1] == 6, "the budget allows no splits"
     torch.testing.assert_close(out, torch.nn.functional.scaled_dot_product_attention(q, k, v))
 
 
-@pytest.mark.parametrize("order", ["per_level", "global"])
-@pytest.mark.parametrize("score", ["attention", "detail", "random"])
-@pytest.mark.parametrize("budget", [12, 30, 61])
+@pytest.mark.parametrize("order", ["per_level", "global", "tree"])
+@pytest.mark.parametrize("score", ["attention", "detail", "bound", "random"])
+@pytest.mark.parametrize("budget", [17, 35, 66])
 def test_layout_tiles_image_within_budget(layer, budget, score, order):
+    if score == "bound" and order != "tree":
+        pytest.skip("the bound needs tree order's one-pass scores")
     attn, rope = layer
     H, W = 10, 13
     fov = FoveatedAttention(attn, FoveationConfig(budget=budget, start_level=2, score=score, order=order))
     x = torch.randn(2, PREFIX + H * W, DIM, requires_grad=True)
     out, cells, pyramid = fov.attend(*fov.heads(x), RopeGrid(patch_coords(rope, H, W), rope.periods))
 
-    assert cells.shape[-1] <= budget
+    roots, slots = 12, budget - PREFIX  # 10x13 patches give 3x4 start cells
+    assert cells.shape[-1] == slots, "every head reads exactly `budget` keys"
+    real_cells = (pyramid.counts[cells] > 0).sum(-1)
+    if order == "tree":  # fills its slots, up to two left over, while splits remain
+        assert (real_cells >= slots - 2).all() and (real_cells <= slots).all()
+    else:  # splits by quadrant, so edge splits leave padding cells in their slots
+        assert (real_cells <= roots + 3 * ((slots - roots) // 3)).all()
     patches = ((pyramid.level == 0) & (pyramid.counts > 0)).nonzero().flatten().tolist()
     for head_cells in cells.flatten(0, 1):
         assert sorted(leaf_patches(head_cells.tolist(), pyramid)) == patches, "cells must tile the image exactly once"
@@ -132,7 +140,7 @@ def test_foveated_model_reproduces_dense_model():
     for block in dense.blocks:
         sharpen(block.attn)
     H, W = 8, 6
-    fov = foveate(copy.deepcopy(dense), FoveationConfig(budget=padded_patches(H, W, 2), start_level=2))
+    fov = foveate(copy.deepcopy(dense), FoveationConfig(budget=padded_patches(H, W, 2) + PREFIX, start_level=2))
     assert fov.state_dict().keys() == dense.state_dict().keys()
 
     image = torch.randn(1, 3, H * 16, W * 16)
@@ -140,3 +148,37 @@ def test_foveated_model_reproduces_dense_model():
         expected, actual = dense.forward_features(image), fov.forward_features(image)
     for key in ("x_norm_clstoken", "x_norm_patchtokens"):
         torch.testing.assert_close(actual[key], expected[key], atol=1e-4, rtol=1e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="compiles for the GPU")
+def test_compiled_pooling_matches_eager(layer):
+    attn, rope = layer
+    attn, rope = attn.cuda(), rope.cuda()
+    H, W = 10, 13
+    x = torch.randn(2, PREFIX + H * W, DIM, device="cuda")
+    grid = RopeGrid(patch_coords(rope, H, W), rope.periods)
+    eager, compiled = (
+        FoveatedAttention(attn, FoveationConfig(budget=35, start_level=2, compile=flag)) for flag in (False, True)
+    )
+    with torch.no_grad():
+        torch.testing.assert_close(compiled(x, rope=grid), eager(x, rope=grid), atol=1e-5, rtol=1e-4)
+
+
+def test_oracle_and_spread_criteria_vanish_on_uniform_cells(layer):
+    from dinov3.foveation.split_criteria import criteria, oracle
+
+    _, rope = layer
+    H, W, d = 8, 12, DIM // HEADS
+    grid = RopeGrid(patch_coords(rope, H, W), torch.full_like(rope.periods, torch.inf))  # no rotation
+    q = torch.randn(1, HEADS, PREFIX + H * W, d)
+    k, v = torch.randn(2, 1, HEADS, PREFIX + H * W, d)
+    cell_k, cell_v = torch.randn(2, 1, HEADS, H // 4, W // 4, d)
+    k[:, :, PREFIX:], v[:, :, PREFIX:] = (
+        t.repeat_interleave(4, 2).repeat_interleave(4, 3).flatten(2, 3) for t in (cell_k, cell_v)
+    )
+    scores, pyramid = criteria(q, k, v, grid, FoveationConfig(start_level=2, score_level=2))
+    truth = oracle(q, k, v, pyramid, H, W, n_queries=PREFIX + H * W)
+    cells = pyramid.layout.level_cells(2)
+    torch.testing.assert_close(truth[:, cells], torch.zeros_like(truth[:, cells]), atol=1e-5, rtol=0)
+    for name in ("value_spread", "bound", "kl", "covariance"):
+        torch.testing.assert_close(scores[name][:, cells], torch.zeros_like(truth[:, cells]), atol=1e-5, rtol=0)

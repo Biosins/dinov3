@@ -19,3 +19,6 @@ dist/
 
 # Downloaded model weights
 weights/
+
+# Downloaded datasets
+data/
