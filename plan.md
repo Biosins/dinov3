@@ -22,13 +22,13 @@ Test whether per-head, attention-guided foveation can cut ViT attention cost at 
 
 | Parameter | Starting value | Status |
 | --- | --- | --- |
-| Key budget K per head | 1,024 | Value used in the cost estimates; tuned in Phase 0 |
-| Starting grid | 64px or 32px cells | Ablated in Phase 1 |
+| Key budget K per head | 1,024 | Value used in the cost estimates; tuned in Phase 0. Since Oct 17, 2026 K counts the CLS and register tokens |
+| Starting grid | 64px or 32px cells | Ablated in Phase 1. At 4K, 64px start cells alone exceed K = 1,024, so 4K uses 128px |
 | Patch size, Phases 0 and 1 | 16px | Fixed, matches DINOv3 |
 | Minimum patch size, Phase 2 | 4px | Fixed for the first attempt |
 | Image sizes | 1K to 4K | Phase 0 repeats the check at several sizes |
 | Accuracy tolerance vs dense DINOv3 | Not set | Open: to be agreed |
-| Benchmarks | Segmentation and depth probes | Open: datasets not yet chosen |
+| Benchmarks | Segmentation and depth probes | Phase 0 uses DIV2K validation (100 2K photos, in data/). DIS5K is the candidate fine-detail segmentation probe. Depth set not chosen |
 | Speedup target | Not set | Open: to be agreed |
 
 ## Glossary
@@ -172,13 +172,39 @@ Choices made while implementing, to revisit once Phase 0 and Phase 1 results are
 | Selection order (Oct 17, 2026) | Level by level, coarsest first. At each level, only the cells the level above created compete, and the top ones split | Attention mass grows with cell area, so ranking cells of different sizes together always favours splitting the biggest. In the first Phase 0 run this left only about 6% of attention on 16px keys at K = 1,024 | Global priority queue: better allocation but sequential. This also fixes the number of scoring rounds at one per level, so the Phase 1 "number of refinement rounds" ablation no longer applies |
 | Global, area-normalised order (Oct 17, 2026) | Tried as `order="global"`: each round ranks every splittable cell by score per 16px patch | Lets cells of different sizes compete directly, so the data decides how much budget each level gets | Pilot, 2 images, untrained, end to end: slightly worse than per-level everywhere (final CLS cosine 0.837 vs 0.846 at K = 1,024). Keep as an option; revisit with more images |
 | Split score (Oct 17, 2026) | Tried as `score="detail"`: attention mass × RMS spread of the cell's patch values, a rough estimate of the output error from leaving the cell unsplit | Attention mass alone says where a head looks, not whether splitting changes anything; flat regions are cheap to keep coarse. Layouts showed some heads foveating borders or sweeping the image top to bottom | Pilot, same setup: best of all variants. Final CLS cosine 0.867 vs 0.846 for attention mass and 0.824 for random at K = 1,024; 0.948 vs 0.928 and 0.901 at K = 2,048. Same ranking on both images. **Default since Oct 17, 2026**; recheck on a real image set |
-| Splits per level (Oct 17, 2026) | **Provisional:** spare budget shared equally between levels. Splits a level cannot take, because the level above created too few cells, pass down. HD at K = 1,024 with 64px start cells: 86 splits at 64px, 85 at 32px | A neutral default between breadth and depth | Coarse-first: as many splits as possible at the top, giving a wide medium-detail view. Fine-first: split just enough at the top to reach 16px everywhere chosen, giving fewer but sharper regions. Ablate in Phase 1 |
+| Splits per level (Oct 17, 2026) | **Provisional:** spare budget shared equally between levels. Splits a level cannot take, because the level above created too few cells, pass down. HD at K = 1,024 with 64px start cells: 86 splits at 64px, 85 at 32px | A neutral default between breadth and depth | Coarse-first: as many splits as possible at the top, giving a wide medium-detail view. Fine-first: split just enough at the top to reach 16px everywhere chosen, giving fewer but sharper regions. Ablate in Phase 1. Equal-slope allocation (below) replaces the fixed shares altogether |
+| Split criterion, tested (Oct 17, 2026) | Compared criteria against each cell's true output error: the change in a head's output, over 256 sampled queries, when only that cell is pooled. Run with `split_criteria.py` | Attention mass says where a head looks, not what pooling a cell costs. Rate-distortion and first-order error analysis suggest better scores | 10 DIV2K images, HD, all heads, 32px and 64px cells. Rank correlation with true error: bound 0.830, KL 0.817, first-order covariance 0.801, mass × value spread 0.789, mass 0.633, random 0.00. The bound (query norm × mass × key spread × value spread / √d, rotated keys) beat mass × value spread on all 10 images. Middle layers are hardest for every criterion |
+| Equal-slope allocation (Oct 17, 2026) | Implemented as `order="tree"`, with `score="bound"`. One scoring pass of the pooled queries over every 16px key gives every cell's error estimate at once, with masses summed up the pyramid. Each head bisects on its own price per key, so it splits a cell exactly when the error removed per added key beats that price. Leftover slots are filled greedily | Lets each head choose its own mix of cell sizes, which fixed per-level quotas cannot. Rate-distortion's equal-slope rule, the same logic as cost-complexity pruning in decision trees | Smoke photo, end to end, K = 1,024: final CLS cosine 0.913 vs 0.894 for per-level + detail and 0.823 for random; 0.966 vs 0.959 at K = 2,048. Most of the gain is the criterion (equal-slope + detail: 0.896). Scoring costs about 3% of dense attention at HD and stays linear in image size only while the number of scoring queries stays fixed. Not yet the default: time it and compare on more images first |
+| Budget includes CLS and registers (Oct 17, 2026) | `budget` is the exact key count per head, CLS and 4 registers included. Unused slots hold empty cells with zero attention | A fixed, kernel-friendly key count such as 1,024 | Splits add 3 keys, so the cell count is start cells + 3 × splits and up to 2 slots stay empty: at HD, 1,017 cells + 5 = 1,022 real keys of 1,024. The register count was left at DINOv3's pretrained 4: removing registers would hurt features, new ones need training, and the remainder depends on image size anyway. Partial splits (one cell into fewer tokens) could fill the last slots if they ever matter |
+| Pyramid speed-ups (Oct 17, 2026) | Layout and RoPE sin/cos computed once per forward pass and shared by all layers; queries pooled only to the scoring level; optional `torch.compile` of the per-layer pooling (`compile=True`, recompiles per image size) | Building the pyramid cost more than the attention it saved at HD | See "Results so far". Next: fold the log-count bonus into the attention kernel instead of passing it as a mask (Phase 3) |
+
+## Results so far
+
+All on pretrained ViT-L/16 with no training, so they measure the starting gap that Phase 1 distillation has to close.
+
+**Phase 0 on DIV2K** (100 validation images at HD, per-layer check, per-level order with the detail score):
+
+| K | Attention on 16px keys | Output cosine vs dense | Heads with cosine ≥ 0.95 |
+| --- | --- | --- | --- |
+| 1,024 | 10% ± 2% | 0.948 ± 0.019 | 63% |
+| 2,048 | 25% ± 3% | 0.971 ± 0.012 | 83% |
+
+Middle layers (5 to 11) are weakest. Running every layer foveated compounds the errors through the middle of the network, so end-to-end checks matter more than per-layer ones.
+
+**Speed** (`benchmark.py`, bf16, RTX 3080, K = 1,024, compiled pooling):
+
+| Image | Dense | Foveated | Speedup | Attention FLOPs, dense vs foveated |
+| --- | --- | --- | --- | --- |
+| HD, 120×68 patches, 64px start | 278 ms | 216 ms | 1.3× | 6.6 vs 0.9 TFLOPs |
+| 4K, 240×135 patches, 128px start | 2,359 ms | 775 ms | 3.0× | 103 vs 3.3 TFLOPs |
+
+The projections and MLPs run on every token and set a floor: at HD they are most of the remaining cost. At 4K the rest is mainly the pyramid build (122 ms) and the final attention (167 ms), which uses a slower kernel because the log-count bonus is passed as a mask. Measured with per-level order; equal-slope order not timed yet. A 128px start is no faster at HD.
 
 ## Risks and open questions
 
 - Fixed K may stop capturing enough attention mass as images grow. Phase 0 measures how the needed K scales with resolution.
 - Mean-pooled coarse keys can smear sharp features, so a cell worth splitting may look unremarkable. Try max-pooled keys or mass per unit area within a level for scoring.
-- Open (Oct 17, 2026): the per-level schedule fixes how many splits each level gets, the same for every head. A head that cares about only a few cells still has to spend its full quota at the coarse level. In the HD pilot, layer 1, head 8 had 482 of its 510 64px cells score exactly zero and only one above a millionth of the maximum, so 85 of its 86 64px splits went to zero-score cells in index order. 4 of 384 heads did this, all in layer 1; it wastes budget but does not change outputs. The goal is to let each head choose its own mix of cell sizes, for example a flat head turning the whole image into 32px cells and a focused head spending everything on 16px cells in one region, while keeping static shapes for batching. Area-normalised global order (`order="global"`) is a first step but still fixes splits per round, and scored slightly worse in the pilot. Revisit after Phase 0 runs on a real image set.
+- Open (Oct 17, 2026): the per-level schedule fixes how many splits each level gets, the same for every head. A head that cares about only a few cells still has to spend its full quota at the coarse level. In the HD pilot, layer 1, head 8 had 482 of its 510 64px cells score exactly zero and only one above a millionth of the maximum, so 85 of its 86 64px splits went to zero-score cells in index order. 4 of 384 heads did this, all in layer 1; it wastes budget but does not change outputs. The goal is to let each head choose its own mix of cell sizes, for example a flat head turning the whole image into 32px cells and a focused head spending everything on 16px cells in one region, while keeping static shapes for batching. Area-normalised global order (`order="global"`) is a first step but still fixes splits per round, and scored slightly worse in the pilot. Revisit after Phase 0 runs on a real image set. Update: equal-slope allocation (`order="tree"`) addresses this; on the smoke photo every head fills its budget and heads with little to split spend it at their own mix of sizes. Confirm on more images.
 - The layout choice is not differentiable. The coarse scorer may need an auxiliary loss, such as matching the full-resolution attention distribution.
 - Heads may collapse to similar layouts. Fixing a few heads as global coarse or local fine may stabilise training.
 - Pretrained DINOv3 MLPs expect 16px semantics. Changing the key set is a light adaptation, but a 4px stream is a heavy one.
