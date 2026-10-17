@@ -20,6 +20,7 @@ dependencies = [
     "omegaconf>=2.4.0",
     "pandas>=3.0.6",
     "regex>=2026.9.29",
+    "safetensors>=0.8.0",
     "scikit-learn>=1.9.1",
     "scikit-learn-intelex>=2026.2.0",
     "submitit>=1.5.4",
@@ -100,5 +101,7 @@ dev = [
     "docstr-coverage==2.3.2",
     "mypy[reports]==1.17",
     "pylint==3.3.8",
+    "pytest>=9.1.1",
     "ruff==0.12.8",
+    "transformers>=5.20.1",
 ]
