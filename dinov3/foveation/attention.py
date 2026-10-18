@@ -446,34 +446,32 @@ def beam_errors(
     """Estimated errors [B, h, M], mass times value variance, for the cells a top-down beam reaches, and which cells
     may split [B, h, M], without attending to every fine key.
 
-    Round by round from the start cells down, the scoring queries attend to the CLS and register tokens plus the
-    current cells. A pooled cell stands for its patches' keys, so its logit gets log(count) plus a second-order
-    correction for their spread, 0.5 |q|^2 var(k) / d^2: without it, cells with varied keys, the ones worth
-    splitting, would look less attended than they are. A cell's error bounds what any splitting beneath it can
+    Top-down, round by round from the start cells, the scoring queries attend to the CLS and register tokens plus
+    the current cells, each with the log-count bias. A cell's error bounds what any splitting beneath it can
     recover, since its variance is over all its patches (law of total variance). So each round expands the cells
     with the largest errors, as many as a head can split in total, (n_slots - start cells) // 3, and their children
     are scored next round. Expanded cells may split, and so may 32px cells, whose fine children are exact.
+
+    Then bottom-up, each expanded cell's mass becomes the sum of its children's, as in full scoring. A split's gain
+    is a small difference between a cell's error and its children's, so masses estimated in different rounds, each
+    with its own error, would swamp it.
     """
     layout, d, n_prefix = pyramid.layout, queries.shape[-1], prefix_keys.shape[2]
     levels, null = len(layout.shapes) - 1, len(layout.counts) - 1
     beam = (n_slots - len(layout.roots)) // 3
-    correction = 0.5 * key_spread(pyramid).square() / d**2  # times |q|^2 for each scoring query
-    query_norms = queries.float().square().sum(-1)[..., None]  # [B, h, Q, 1]
     variance = pyramid.spread.float().square()
-    errors = torch.zeros_like(variance)
-    splittable = (layout.level == 1).expand_as(errors).clone()
+    masses = torch.zeros_like(variance)
+    splittable = (layout.level == 1).expand_as(masses).clone()
     cells = pyramid.roots.expand(*queries.shape[:2], -1)
     for level in range(levels, 0, -1):
         keys = torch.cat([prefix_keys, gather_cells(pyramid.keys, cells)], dim=2)
         bias = F.pad(layout.counts.log()[cells], (n_prefix, 0))[:, :, None]
-        bias = bias + query_norms * F.pad(correction.gather(-1, cells), (n_prefix, 0))[:, :, None]
         probs = (queries @ keys.mT * d**-0.5 + bias).softmax(-1)
         mass = (weights[:, None] * probs).sum(-2)[..., n_prefix:]
-        error = mass * variance.gather(-1, cells)
-        errors = errors.scatter(-1, cells, error)
+        masses = masses.scatter(-1, cells, mass)
         if level == 1:
             break
-        candidates = error.masked_fill(layout.level[cells] != level, -math.inf)
+        candidates = (mass * variance.gather(-1, cells)).masked_fill(layout.level[cells] != level, -math.inf)
         best = candidates.topk(min(beam, cells.shape[-1]), dim=-1)
         picked = cells.gather(-1, best.indices)
         expand = best.values.isfinite()
@@ -482,6 +480,10 @@ def beam_errors(
         quads = layout.children[parents]  # all null for the null cell
         quads[..., 0] = torch.where(expand, quads[..., 0], picked)  # so picks that are not expanded stay put
         cells = torch.cat([cells.scatter(-1, best.indices, quads[..., 0]), quads[..., 1:].flatten(-2)], dim=-1)
+    for level in range(2, levels + 1):
+        summed = masses[..., layout.children].sum(-1)
+        masses = torch.where(splittable & (layout.level == level), summed, masses)
+    errors = masses * variance
     errors[..., -1], splittable[..., -1] = 0, False  # the null cell; -1 keeps the index static
     return errors, splittable
 
