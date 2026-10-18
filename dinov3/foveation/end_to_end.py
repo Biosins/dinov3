@@ -64,15 +64,23 @@ def layouts(budgets: list[int], start_level: int, roots: int, n_prefix: int) -> 
         )
     }
     for budget in budgets:
-        for order, score in [
-            ("per_level", "attention"),
-            ("per_level", "detail"),
-            ("tree", "detail"),
-            ("tree", "bound"),
-            ("per_level", "random"),
+        for order, score, scoring in [
+            ("per_level", "attention", "full"),
+            ("per_level", "detail", "full"),
+            ("tree", "detail", "full"),
+            ("tree", "bound", "full"),
+            ("tree", "variance", "full"),
+            ("tree", "variance", "beam"),
+            ("per_level", "random", "full"),
         ]:
-            configs[f"{order} {score} K={budget}"] = FoveationConfig(
-                budget=budget, start_level=start_level, score_level=start_level, order=order, score=score
+            name = f"{order} {score}{' beam' if scoring == 'beam' else ''} K={budget}"
+            configs[name] = FoveationConfig(
+                budget=budget,
+                start_level=start_level,
+                score_level=start_level,
+                order=order,
+                score=score,
+                scoring=scoring,
             )
     return configs
 

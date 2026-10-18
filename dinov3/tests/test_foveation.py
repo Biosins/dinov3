@@ -52,11 +52,19 @@ def test_rope_rotate_matches_rope_embedding(normalize):
     torch.testing.assert_close(rope_rotate(x, patch_coords(rope, 6, 10).flatten(0, 1), rope.periods), expected)
 
 
-@pytest.mark.parametrize("order", ["per_level", "global", "tree"])
+LAYOUTS = dict(
+    per_level=dict(order="per_level"),
+    global_=dict(order="global"),
+    tree=dict(order="tree"),
+    tree_beam=dict(order="tree", score="variance", scoring="beam"),
+)
+
+
+@pytest.mark.parametrize("layout", LAYOUTS.values(), ids=LAYOUTS.keys())
 @pytest.mark.parametrize("H, W", [(8, 8), (6, 10)])  # 6x10 exercises the padding
-def test_full_budget_reproduces_dense_layer(layer, H, W, order):
+def test_full_budget_reproduces_dense_layer(layer, H, W, layout):
     attn, rope = layer
-    config = FoveationConfig(budget=padded_patches(H, W, 2) + PREFIX, start_level=2, score_level=1, order=order)
+    config = FoveationConfig(budget=padded_patches(H, W, 2) + PREFIX, start_level=2, score_level=1, **layout)
     x = torch.randn(2, PREFIX + H * W, DIM)
     expected = attn(x, rope=rope(H=H, W=W))
     actual = FoveatedAttention(attn, config)(x, rope=RopeGrid(patch_coords(rope, H, W), rope.periods))
@@ -80,15 +88,20 @@ def test_log_count_bonus_makes_uniform_cells_exact(layer):
     torch.testing.assert_close(out, torch.nn.functional.scaled_dot_product_attention(q, k, v))
 
 
-@pytest.mark.parametrize("order", ["per_level", "global", "tree"])
-@pytest.mark.parametrize("score", ["attention", "detail", "bound", "random"])
+@pytest.mark.parametrize(
+    "order, scoring", [("per_level", "full"), ("global", "full"), ("tree", "full"), ("tree", "beam")]
+)
+@pytest.mark.parametrize("score", ["attention", "detail", "bound", "variance", "random"])
 @pytest.mark.parametrize("budget", [17, 35, 66])
-def test_layout_tiles_image_within_budget(layer, budget, score, order):
+def test_layout_tiles_image_within_budget(layer, budget, score, order, scoring):
     if score == "bound" and order != "tree":
         pytest.skip("the bound needs tree order's one-pass scores")
+    if scoring == "beam" and score != "variance":
+        pytest.skip("beam scoring estimates mass times value variance")
     attn, rope = layer
     H, W = 10, 13
-    fov = FoveatedAttention(attn, FoveationConfig(budget=budget, start_level=2, score=score, order=order))
+    config = FoveationConfig(budget=budget, start_level=2, score=score, order=order, scoring=scoring)
+    fov = FoveatedAttention(attn, config)
     x = torch.randn(2, PREFIX + H * W, DIM, requires_grad=True)
     out, cells, pyramid = fov.attend(*fov.heads(x), RopeGrid(patch_coords(rope, H, W), rope.periods))
 
@@ -198,15 +211,19 @@ def test_foveated_model_reproduces_dense_model():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="compiles for the GPU")
-@pytest.mark.parametrize("order, score", [("per_level", "detail"), ("tree", "bound")])
-def test_compiled_foveation_matches_eager(layer, order, score):
+@pytest.mark.parametrize(
+    "order, score, scoring", [("per_level", "detail", "full"), ("tree", "bound", "full"), ("tree", "variance", "beam")]
+)
+def test_compiled_foveation_matches_eager(layer, order, score, scoring):
     attn, rope = layer
     attn, rope = attn.cuda(), rope.cuda()
     H, W = 10, 13
     x = torch.randn(2, PREFIX + H * W, DIM, device="cuda")
     grid = RopeGrid(patch_coords(rope, H, W), rope.periods)
     eager, compiled = (
-        FoveatedAttention(attn, FoveationConfig(budget=35, start_level=2, order=order, score=score, compile=flag))
+        FoveatedAttention(
+            attn, FoveationConfig(budget=35, start_level=2, order=order, score=score, scoring=scoring, compile=flag)
+        )
         for flag in (False, True)
     )
     with torch.no_grad():

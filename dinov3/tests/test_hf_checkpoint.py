@@ -9,7 +9,7 @@ from dinov3.hub.hf_checkpoint import load_hf_checkpoint
 WEIGHTS = Path(__file__).parents[2] / "weights"
 
 
-@pytest.mark.parametrize("arch", ["vits16", "vitl16"])
+@pytest.mark.parametrize("arch", ["vits16", "vitb16", "vitl16"])
 def test_converted_checkpoint_matches_transformers(arch):
     path = WEIGHTS / f"dinov3-{arch}-pretrain-lvd1689m"
     if not path.exists():

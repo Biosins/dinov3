@@ -74,7 +74,12 @@ def measure(run: Callable[[torch.Tensor], object], x: torch.Tensor, dtype: torch
     torch.cuda.synchronize()
     peak_mb = (torch.cuda.max_memory_allocated() - base) / 2**20
 
-    timer = benchmark.Timer(stmt="forward(); torch.cuda.synchronize()", globals=dict(forward=forward, torch=torch))
+    # Timer runs on one thread by default; torch.compile guards on the thread count, so that would recompile
+    timer = benchmark.Timer(
+        stmt="forward(); torch.cuda.synchronize()",
+        globals=dict(forward=forward, torch=torch),
+        num_threads=torch.get_num_threads(),
+    )
     time_ms = timer.blocked_autorange(min_run_time=min_run_time).median * 1e3
 
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
