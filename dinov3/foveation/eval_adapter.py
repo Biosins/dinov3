@@ -35,7 +35,7 @@ def main():
     run = json.loads((args.run / "config.json").read_text())
     adapter = torch.load(args.run / "adapter.pt")
     teacher = load_model(run["arch"], run["weights"]).cuda().eval().requires_grad_(False)
-    val = Images(args.val, run["size"], teacher.patch_size, flip=False, limit=args.val_images)
+    val = Images(args.val, run.get("sizes") or [run["size"]], teacher.patch_size, augment=False, limit=args.val_images)
 
     rows = []
     for budget in args.budgets:

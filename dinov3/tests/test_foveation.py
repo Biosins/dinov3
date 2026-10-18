@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from dinov3.foveation import FoveatedAttention, FoveationConfig, RopeGrid, foveate, patch_coords
+from dinov3.foveation.attention import reconfigure
 from dinov3.foveation.attention import build_pyramid, level_schedule, rope_rotate, round_schedule, split_thresholds
 from dinov3.foveation.phase0 import spread_to_patches
 from dinov3.hub.backbones import dinov3_vits16
@@ -208,6 +209,20 @@ def test_foveated_model_reproduces_dense_model():
         expected, actual = dense.forward_features(image), fov.forward_features(image)
     for key in ("x_norm_clstoken", "x_norm_patchtokens"):
         torch.testing.assert_close(actual[key], expected[key], atol=1e-4, rtol=1e-3)
+
+
+def test_reconfigured_model_follows_its_new_budget_and_start_level():
+    torch.manual_seed(0)
+    dense = dinov3_vits16(pretrained=False).eval()
+    for block in dense.blocks:
+        sharpen(block.attn)
+    H, W = 8, 6
+    fov = foveate(copy.deepcopy(dense), FoveationConfig(budget=PREFIX + 12, start_level=2))
+    reconfigure(fov, FoveationConfig(budget=padded_patches(H, W, 1) + PREFIX, start_level=1, score_level=1))
+    image = torch.randn(1, 3, H * 16, W * 16)
+    with torch.no_grad():
+        expected, actual = dense.forward_features(image), fov.forward_features(image)
+    torch.testing.assert_close(actual["x_norm_clstoken"], expected["x_norm_clstoken"], atol=1e-4, rtol=1e-3)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="compiles for the GPU")

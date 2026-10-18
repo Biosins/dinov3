@@ -49,9 +49,10 @@ def patch_aligned_size(height: int, width: int, long_side: int, patch_size: int)
     return [max(1, round(side * scale / patch_size)) * patch_size for side in (height, width)]
 
 
-def resize_image(path: Path, long_side: int, patch_size: int) -> Tensor:
-    """uint8 image resized to its patch-aligned size."""
-    image = decode_image(str(path), mode=ImageReadMode.RGB)
+def resize_image(image: Path | Tensor, long_side: int, patch_size: int) -> Tensor:
+    """uint8 image, from a file or already decoded [3, H, W], resized to its patch-aligned size."""
+    if isinstance(image, Path):
+        image = decode_image(str(image), mode=ImageReadMode.RGB)
     size = patch_aligned_size(*image.shape[-2:], long_side, patch_size)
     return v2.functional.resize(image, size, interpolation=v2.InterpolationMode.BICUBIC, antialias=True)
 

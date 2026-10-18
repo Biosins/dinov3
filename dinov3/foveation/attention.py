@@ -278,6 +278,12 @@ def build_pyramid(
     return Pyramid(queries, query_counts, keys, values, spread, layout)
 
 
+def start_cells(H: int, W: int, level: int) -> int:
+    """Start cells, 2**level patches wide, covering an H x W patch grid."""
+    side = 2**level
+    return -(-H // side) * -(-W // side)
+
+
 def _spare_splits(roots: int, budget: int) -> int:
     """Each split adds three cells to the start cells."""
     if roots > budget:
@@ -651,9 +657,9 @@ class FoveatedAttention(nn.Module):
         return out, cells, pyramid
 
 
-def _rope_grid(rope: RopePositionEmbedding, args, kwargs, output, levels: int) -> RopeGrid:
+def _rope_grid(rope: RopePositionEmbedding, args, kwargs, output, model: DinoVisionTransformer) -> RopeGrid:
     grid = RopeGrid(patch_coords(rope, kwargs["H"], kwargs["W"]), rope.periods)
-    return grid._replace(layout=pyramid_layout(grid, levels))
+    return grid._replace(layout=pyramid_layout(grid, model.blocks[0].attn.config.start_level))
 
 
 def foveate(model: DinoVisionTransformer, config: FoveationConfig) -> DinoVisionTransformer:
@@ -663,5 +669,13 @@ def foveate(model: DinoVisionTransformer, config: FoveationConfig) -> DinoVision
         raise ValueError("Build the model with drop_path_rate=0 before foveating it")
     for block in model.blocks:
         block.attn = FoveatedAttention(block.attn, config)
-    model.rope_embed.register_forward_hook(partial(_rope_grid, levels=config.start_level), with_kwargs=True)
+    model.rope_embed.register_forward_hook(partial(_rope_grid, model=model), with_kwargs=True)
     return model
+
+
+def reconfigure(model: nn.Module, config: FoveationConfig) -> None:
+    """Switches every FoveatedAttention in a foveated model, or a wrapper around one, to config, e.g. to train with
+    a different budget for each image."""
+    for module in model.modules():
+        if isinstance(module, FoveatedAttention):
+            module.config = config

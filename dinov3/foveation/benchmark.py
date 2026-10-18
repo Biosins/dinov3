@@ -21,16 +21,11 @@ from torch.profiler import ProfilerActivity, profile
 from torch.utils import benchmark
 
 from dinov3.data.transforms import make_base_transform
-from dinov3.foveation.attention import FoveationConfig, foveate, level_schedule
+from dinov3.foveation.attention import FoveationConfig, foveate, level_schedule, start_cells
 from dinov3.foveation.phase0 import ARCHS, load_model
 from dinov3.models.vision_transformer import DinoVisionTransformer
 
 STAGES = ["foveation.pyramid", "foveation.select", "foveation.attend"]
-
-
-def start_cells(H: int, W: int, level: int) -> int:
-    side = 2**level
-    return -(-H // side) * -(-W // side)
 
 
 def flops(model: DinoVisionTransformer, H: int, W: int, config: FoveationConfig | None) -> dict[str, float]:
