@@ -63,6 +63,23 @@ def distance(student: tuple[Tensor, Tensor], teacher: tuple[Tensor, Tensor]) -> 
     return tuple(1 - F.cosine_similarity(s, t, dim=-1).mean() for s, t in zip(student, teacher))
 
 
+def foveation_config(run: dict) -> FoveationConfig:
+    """The foveation config of a run, from its command-line arguments or saved config.json."""
+    return FoveationConfig(
+        budget=run["budget"],
+        start_level=run["start_level"],
+        score_level=run["start_level"],
+        order=run["order"],
+        score=run["score"],
+    )
+
+
+def make_student(teacher, config: FoveationConfig, rank: int):
+    """A foveated copy of the teacher with LoRA adapters on every block's qkv and proj."""
+    lora = LoraConfig(r=rank, lora_alpha=2 * rank, target_modules=r"blocks\.\d+\.attn\.(qkv|proj)")
+    return get_peft_model(foveate(copy.deepcopy(teacher), config), lora)
+
+
 @torch.no_grad()
 def evaluate(student, teacher, images: Images) -> dict[str, float]:
     cls, patches = [], []
@@ -104,15 +121,8 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
 
     teacher = load_model(args.arch, args.weights).cuda().eval().requires_grad_(False)
-    config = FoveationConfig(
-        budget=args.budget,
-        start_level=args.start_level,
-        score_level=args.start_level,
-        order=args.order,
-        score=args.score,
-    )
-    lora = LoraConfig(r=args.rank, lora_alpha=2 * args.rank, target_modules=r"blocks\.\d+\.attn\.(qkv|proj)")
-    student = get_peft_model(foveate(copy.deepcopy(teacher), config), lora)
+    config = foveation_config(vars(args))
+    student = make_student(teacher, config, args.rank)
     trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
     logger.info(f"Training {trainable:,} LoRA parameters on {config}")
 

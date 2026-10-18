@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from dinov3.foveation import FoveatedAttention, FoveationConfig, RopeGrid, foveate, patch_coords
-from dinov3.foveation.attention import build_pyramid, level_schedule, rope_rotate, round_schedule
+from dinov3.foveation.attention import build_pyramid, level_schedule, rope_rotate, round_schedule, split_thresholds
 from dinov3.foveation.phase0 import spread_to_patches
 from dinov3.hub.backbones import dinov3_vits16
 from dinov3.layers.attention import SelfAttention, rope_apply
@@ -110,6 +110,53 @@ def test_layout_tiles_image_within_budget(layer, budget, score, order):
     assert x.grad is not None and x.grad.isfinite().all()
 
 
+def cheapest_tiling_splits(layout, errors: torch.Tensor, price: float) -> list[torch.Tensor]:
+    """Reference for split_thresholds: the cells the cheapest tiling splits at this price per key, found bottom-up by
+    comparing each cell's error plus the price with the cheapest tiling of its children."""
+    levels = len(layout.shapes) - 1
+    real = [(layout.counts[layout.level_cells(lvl)] > 0).view(layout.shapes[lvl]) for lvl in range(levels + 1)]
+    error = [errors[..., layout.level_cells(lvl)].unflatten(-1, layout.shapes[lvl]) for lvl in range(levels + 1)]
+    cost, splits = (error[0] + price) * real[0], [None]
+    for lvl in range(1, levels + 1):
+        children = torch.nn.functional.avg_pool2d(cost, 2, divisor_override=1)
+        keep = (error[lvl] + price) * real[lvl]
+        splits.append((children < keep) & real[lvl])
+        cost = torch.where(splits[-1], children, keep)
+    return splits
+
+
+@pytest.mark.parametrize("H, W, levels", [(10, 13, 2), (19, 27, 3)])
+def test_split_thresholds_match_the_cheapest_tiling_at_every_price(layer, H, W, levels):
+    """Splits whose ancestors all split at a price must be exactly those the cheapest tiling makes. The errors are
+    random, so splitting a cell can raise the estimated error, as the bound sometimes does."""
+    _, rope = layer
+    q, k, v = torch.randn(3, 1, HEADS, H, W, DIM // HEADS)
+    layout = build_pyramid(q, k, v, RopeGrid(patch_coords(rope, H, W), rope.periods), levels=levels).layout
+    errors = torch.rand(1, HEADS, len(layout.counts), dtype=torch.float64) * torch.rand(1, HEADS, 1).double() * 10
+    threshold, _ = split_thresholds(layout, errors)
+    for price in torch.rand(50, dtype=torch.float64).tolist():
+        expected = cheapest_tiling_splits(layout, errors, price * 3)
+        for lvl in range(1, levels + 1):
+            reached = torch.ones_like(expected[lvl])
+            for above in range(levels, lvl, -1):  # cells below an unsplit ancestor are never reached
+                reached &= _upsample_to(expected[above], expected[lvl].shape)
+            assert torch.equal(expected[lvl] & reached, threshold[lvl] > price * 3)
+
+
+def _upsample_to(x: torch.Tensor, shape: torch.Size) -> torch.Tensor:
+    side = shape[-1] // x.shape[-1]
+    return x.repeat_interleave(side, -2).repeat_interleave(side, -1)
+
+
+def test_uniform_order_reads_only_the_start_cells(layer):
+    attn, rope = layer
+    H, W = 10, 13
+    fov = FoveatedAttention(attn, FoveationConfig(budget=1000, start_level=2, order="uniform", score="bound"))
+    x = torch.randn(2, PREFIX + H * W, DIM)
+    _, cells, pyramid = fov.attend(*fov.heads(x), RopeGrid(patch_coords(rope, H, W), rope.periods))
+    assert torch.equal(cells, pyramid.roots.expand_as(cells))
+
+
 def test_spread_is_rms_distance_from_cell_mean(layer):
     _, rope = layer
     H, W, d = 6, 10, DIM // HEADS
@@ -151,14 +198,16 @@ def test_foveated_model_reproduces_dense_model():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="compiles for the GPU")
-def test_compiled_pooling_matches_eager(layer):
+@pytest.mark.parametrize("order, score", [("per_level", "detail"), ("tree", "bound")])
+def test_compiled_foveation_matches_eager(layer, order, score):
     attn, rope = layer
     attn, rope = attn.cuda(), rope.cuda()
     H, W = 10, 13
     x = torch.randn(2, PREFIX + H * W, DIM, device="cuda")
     grid = RopeGrid(patch_coords(rope, H, W), rope.periods)
     eager, compiled = (
-        FoveatedAttention(attn, FoveationConfig(budget=35, start_level=2, compile=flag)) for flag in (False, True)
+        FoveatedAttention(attn, FoveationConfig(budget=35, start_level=2, order=order, score=score, compile=flag))
+        for flag in (False, True)
     )
     with torch.no_grad():
         torch.testing.assert_close(compiled(x, rope=grid), eager(x, rope=grid), atol=1e-5, rtol=1e-4)

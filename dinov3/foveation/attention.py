@@ -29,11 +29,13 @@ class FoveationConfig:
     """Selection starts from cells 2**start_level patches wide (2 is 64px at 16px patches)."""
     score_level: int = 2
     """Scoring queries are mean-pooled over cells 2**score_level patches wide."""
-    order: Literal["per_level", "global", "tree"] = "per_level"
+    order: Literal["per_level", "global", "tree", "uniform"] = "per_level"
     """per_level: one no-grad round per level, coarsest first, where cells only compete with cells of their own size.
     global: `rounds` rounds, each ranking every splittable cell by its score per patch covered.
     tree: one scoring pass over all fine keys, then equal-slope allocation: each head splits exactly the cells whose
-    error reduction per added key beats its own threshold, set so its keys fit the budget."""
+    error reduction per added key beats its own threshold, set so its keys fit the budget.
+    uniform: no splits, so every head reads just the start cells, however large the budget. A uniform pooling
+    baseline."""
     score: Literal["attention", "detail", "bound", "random"] = "detail"
     """attention: the attention mass a cell receives. detail: mass times the spread of the cell's patch values, a
     rough estimate of the output error from leaving it unsplit. bound: query norm x mass x key spread x value spread
@@ -41,12 +43,13 @@ class FoveationConfig:
     rounds: int = 3
     """Scoring rounds for global order."""
     compile: bool = False
-    """Compile the per-layer pyramid pooling with torch.compile. Faster, but recompiles for every new image size."""
+    """Compile the pyramid pooling and tree selection with torch.compile. Faster, but recompiles for every new image
+    size."""
 
     def __post_init__(self):
         if not 0 <= self.score_level <= self.start_level:
             raise ValueError("score_level must lie between 0 and start_level")
-        if self.score == "bound" and self.order != "tree":
+        if self.score == "bound" and self.order in ("per_level", "global"):
             raise ValueError('score="bound" needs the one-pass scores of order="tree"')
 
 
@@ -281,7 +284,7 @@ def select_cells(
 ) -> Tensor:
     """Indices [B, h, budget - prefix] of the cells each head attends to; together they tile the image exactly once,
     and any slots left over hold null cells, so with the CLS and register tokens every head reads exactly `budget`
-    keys.
+    keys. Uniform order returns just the start cells instead.
 
     Each round, `queries` [B, h, Q, d], each standing in for `weights` [Q] fine queries, attend to the CLS and
     register tokens plus the current cells, which are then scored (see FoveationConfig.score) and the best split.
@@ -301,10 +304,12 @@ def select_cells(
             return mass * pyramid.spread.gather(-1, cells)
         return mass
 
-    if config.order == "tree":
-        errors = cell_errors(pyramid, queries, weights, prefix_keys, config.score)
-        return _select_tree(pyramid, errors, n_slots)
     roots = pyramid.roots.expand(*queries.shape[:2], -1)
+    if config.order == "uniform":
+        return roots
+    if config.order == "tree":
+        tree_cells = _tree_cells_compiled if config.compile else _tree_cells
+        return tree_cells(pyramid, queries, weights, prefix_keys, config.score, n_slots)
     if config.order == "global":
         cells = _select_global(pyramid, roots, scores, n_slots, config.rounds)
     else:
@@ -343,23 +348,26 @@ def _select_global(pyramid: Pyramid, roots: Tensor, scores, n_slots: int, rounds
 
 
 def cell_errors(
-    pyramid: Pyramid, queries: Tensor, weights: Tensor, prefix_keys: Tensor, score: str, chunk: int = 128
+    pyramid: Pyramid, queries: Tensor, weights: Tensor, prefix_keys: Tensor, score: str, chunk_scores: int = 2**25
 ) -> Tensor:
     """Estimated output error [B, h, M] from leaving each cell pooled, for every cell at once.
 
     The scoring queries attend once to the CLS and register tokens plus every fine key; each patch's attention (and
     its query-norm-weighted attention) is then summed up the pyramid, so a cell's mass is the sum of its children's.
+    Queries go in chunks of about `chunk_scores` attention scores, to bound memory.
     """
     layout, d, n_prefix = pyramid.layout, queries.shape[-1], prefix_keys.shape[2]
     fine = layout.level_cells(0)
     fine_keys = pyramid.keys[:, :, fine]  # rotated; padding patches are masked by their -inf bias
     keys = torch.cat([prefix_keys, fine_keys], dim=2)
-    bias = F.pad(layout.counts[fine].log(), (n_prefix, 0))
+    # In the queries' precision: a float32 bias would promote every [chunk, N] score matrix to float32
+    bias = F.pad(layout.counts[fine].log(), (n_prefix, 0)).to(queries.dtype)
     stats = torch.stack([weights.expand(queries.shape[:3]), weights * queries.norm(dim=-1)], dim=-1)  # [B, h, Q, 2]
     per_patch = 0
+    chunk = max(1, chunk_scores // (queries.shape[0] * queries.shape[1] * keys.shape[2]))
     for rows in torch.arange(queries.shape[2], device=queries.device).split(chunk):
         probs = (queries[:, :, rows] @ keys.mT * d**-0.5 + bias).softmax(-1)[..., n_prefix:]
-        per_patch = per_patch + probs.mT @ stats[:, :, rows].to(probs.dtype)  # [B, h, N', 2]
+        per_patch = per_patch + (probs.mT @ stats[:, :, rows].to(probs.dtype)).float()  # [B, h, N', 2]
     features = torch.cat([per_patch, fine_keys, fine_keys.square().sum(-1, keepdim=True)], dim=-1)
     mass, q_mass, k_sum, k_sq = cell_sums(features.unflatten(2, layout.shapes[0]), len(layout.shapes) - 1).split(
         [1, 1, d, 1], dim=-1
@@ -375,72 +383,105 @@ def cell_errors(
     return errors[score]()
 
 
-def _select_tree(pyramid: Pyramid, errors: Tensor, n_slots: int, iterations: int = 32) -> Tensor:
-    """Equal-slope allocation: with a per-head price per key, the cheapest tiling keeps a cell pooled when its error
-    plus one key's price beats the best tiling of its children. Each head's price is found by bisection so its keys
-    fit the n_slots budget. Key counts jump as the price moves, so the bisection can land a few splits short; those
-    slots are filled greedily with the splits that remove the most estimated error per added key. A split adds one
-    key per real child minus one, so splits on the image edge, whose other children are padding, add fewer. At most
-    two slots stay empty unless a head runs out of cells worth splitting. Empty slots hold null cells, so shapes stay
-    static."""
+def _quad_sum(x: Tensor) -> Tensor:
+    """Sums 2x2 blocks of x [..., H, W]."""
+    return _sum_pool(x[..., None])[..., 0]
+
+
+def _upsample(x: Tensor) -> Tensor:
+    """Repeats each element of x [..., H, W] over a 2x2 block."""
+    return x.repeat_interleave(2, -2).repeat_interleave(2, -1)
+
+
+def _blocks(x: Tensor, side: int) -> Tensor:
+    """The side x side blocks of x [..., H, W], as [..., H / side, W / side, side**2]."""
+    H, W = x.shape[-2:]
+    return x.unflatten(-2, (H // side, side)).unflatten(-1, (W // side, side)).transpose(-3, -2).flatten(-2)
+
+
+def _ratio(gain: Tensor, added: Tensor) -> Tensor:
+    """Error removed per key added. A split that adds no keys is worth any price if it removes error."""
+    free = torch.where(gain >= 0, math.inf, -math.inf)
+    return torch.where(added > 0, gain / added.clamp(min=1), free)
+
+
+def split_thresholds(layout: Layout, errors: Tensor) -> tuple[list[Tensor], list[Tensor]]:
+    """For levels 1 and up: the price per key [B, h, H_l, W_l] below which the cheapest tiling splits each cell, and
+    the keys [H_l, W_l] each split adds (one per real child, minus one). Index 0, the fine level, is None.
+
+    This is cost-complexity pruning (Breiman et al., 1984). At price λ the cheapest tiling splits a cell when its
+    error plus λ exceeds the cheapest tiling of its children. Every split adds keys, so that gap shrinks as λ grows
+    and each cell has one threshold λ*, below which it splits: the tilings for decreasing λ are nested. λ* is the
+    best ratio of error removed to keys added over the nested tilings of the cell's own subtree, built bottom-up
+    from its descendants' thresholds. A cell is only reached if its ancestors split, so its effective threshold is
+    the running minimum of λ* down from its start cell.
+    """
+    levels = len(layout.shapes) - 1
+    real = [(layout.counts[layout.level_cells(level)] > 0).view(layout.shapes[level]) for level in range(levels + 1)]
+    error = [errors[..., layout.level_cells(level)].unflatten(-1, layout.shapes[level]) for level in range(levels + 1)]
+    gain, added, threshold = [None], [None], [None]
+    for level in range(1, levels + 1):
+        gain.append((error[level] - _quad_sum(error[level - 1] * real[level - 1])) * real[level])
+        added.append(((_quad_sum(real[level - 1].to(errors.dtype)) - 1) * real[level]))
+        best = _ratio(gain[level], added[level])
+        # The cell's internal descendants, coarse first, each with the running minimum of thresholds below the cell.
+        # Sorted by that, parents come before children (stable sort on ties), so every prefix is a nested tiling.
+        reach, below = None, []
+        for lower in range(level - 1, 0, -1):
+            reach = threshold[lower] if reach is None else torch.minimum(threshold[lower], _upsample(reach))
+            side = 2 ** (level - lower)
+            below.append([_blocks(t.expand_as(reach), side) for t in (reach, gain[lower], added[lower])])
+        if below:
+            reach, gains, keys = (torch.cat(parts, dim=-1) for parts in zip(*below))
+            order = reach.argsort(dim=-1, descending=True, stable=True)
+            gains = gain[level][..., None] + gains.gather(-1, order).cumsum(-1)
+            keys = added[level][..., None] + keys.gather(-1, order).cumsum(-1)
+            best = torch.maximum(best, _ratio(gains, keys).amax(-1))
+        threshold.append(best.masked_fill(~real[level], -math.inf))
+    for level in range(levels - 1, 0, -1):
+        threshold[level] = torch.minimum(threshold[level], _upsample(threshold[level + 1]))
+    return threshold, added
+
+
+def _select_tree(pyramid: Pyramid, errors: Tensor, n_slots: int) -> Tensor:
+    """Equal-slope allocation in one pass. Sorting every cell by its split threshold (see split_thresholds), parents
+    first on ties, lists the splits so that every prefix is a valid tiling, and each head takes the longest prefix
+    whose keys fit its slots. A split adds one key per real child minus one, so at most two slots stay empty; they
+    hold null cells, so shapes stay static."""
     layout = pyramid.layout
     levels, null = len(layout.shapes) - 1, len(layout.counts) - 1
     _spare_splits(len(layout.roots), n_slots)  # checks the start cells fit
-    by_level = [layout.level_cells(level) for level in range(levels + 1)]
-    real = [(layout.counts[cells] > 0).view(layout.shapes[level]) for level, cells in enumerate(by_level)]
-    error = [errors[..., cells].unflatten(-1, layout.shapes[level]) for level, cells in enumerate(by_level)]
+    threshold, added = split_thresholds(layout, errors)
+    coarse_first = range(levels, 0, -1)
+    ranked = torch.cat([threshold[level].flatten(-2) for level in coarse_first], dim=-1)
+    ranked = ranked.argsort(dim=-1, descending=True, stable=True)
+    keys = torch.cat([added[level].flatten() for level in coarse_first])
+    take = keys[ranked].cumsum(-1) <= n_slots - len(layout.roots)
+    split = torch.zeros_like(take).scatter(-1, ranked, take)
+    sizes = [layout.shapes[level][0] * layout.shapes[level][1] for level in coarse_first]
+    split = dict(zip(coarse_first, split.split(sizes, dim=-1)))
 
-    def quad_sum(x: Tensor) -> Tensor:
-        return _sum_pool(x[..., None])[..., 0]
-
-    def tile(price: Tensor) -> tuple[list[Tensor], Tensor]:
-        """Which cells to split at this price [B, h], and how many keys the cheapest tiling uses."""
-        price = price[..., None, None]
-        cost, keys, splits = real[0] * price, real[0].to(price.dtype), [None]
-        for level in range(1, levels + 1):
-            keep_cost = (error[level] + price) * real[level]
-            split = (quad_sum(cost) < keep_cost) & real[level]
-            cost = torch.where(split, quad_sum(cost), keep_cost)
-            keys = torch.where(split, quad_sum(keys), real[level].to(keys.dtype))
-            splits.append(split)
-        return splits, keys.sum((-2, -1))
-
-    low = torch.zeros(errors.shape[:2], device=errors.device, dtype=errors.dtype)
-    high = errors.amax(-1) + 1
-    for _ in range(iterations):
-        mid = (low + high) / 2
-        fits = tile(mid)[1] <= n_slots
-        high, low = torch.where(fits, mid, high), torch.where(fits, low, mid)
-    splits, _ = tile(high)
-
-    chosen, reached = [], real[levels].expand(splits[levels].shape)
-    for level in range(levels, 0, -1):
-        chosen.append(reached & ~splits[level])
-        reached = (reached & splits[level]).repeat_interleave(2, -2).repeat_interleave(2, -1) & real[level - 1]
+    real = [(layout.counts[layout.level_cells(level)] > 0).view(layout.shapes[level]) for level in range(levels + 1)]
+    chosen, reached = [], real[levels].expand(*errors.shape[:2], -1, -1)
+    for level in coarse_first:
+        splits = split[level].unflatten(-1, layout.shapes[level])
+        chosen.append(reached & ~splits)
+        reached = _upsample(reached & splits) & real[level - 1]
     chosen.append(reached)
     chosen = F.pad(torch.cat([c.flatten(-2) for c in reversed(chosen)], dim=-1), (0, 1))  # Layout order, null last
-
-    # Greedy fill: split the chosen cells that remove the most error per added key, while the slots last.
-    gain = [error[level] - quad_sum(error[level - 1] * real[level - 1]) for level in range(1, levels + 1)]
-    n_fine = by_level[0].stop - by_level[0].start
-    gain = F.pad(torch.cat([g.flatten(-2) for g in gain], dim=-1), (n_fine, 1), value=-math.inf)  # fine, null: never
-    added = (layout.counts[layout.children] > 0).sum(-1) - 1  # [M] keys a split adds; 0 if one child is real
-    for _ in range(3):  # each pass skips splits bigger than the room left, so smaller edge splits still fit
-        room = n_slots - chosen.sum(-1, keepdim=True)
-        fits = chosen & (added > 0) & (added <= room)
-        per_key = (gain / added.clamp(min=1)).masked_fill(~fits, -math.inf)
-        ranked = per_key.argsort(dim=-1, descending=True)
-        worth = per_key.gather(-1, ranked).isfinite()
-        take = worth & ((added[ranked] * worth).cumsum(-1) <= room)
-        picked = torch.where(take, ranked, null)
-        kids = layout.children[picked]  # [B, h, M, 4]
-        kids = torch.where(take[..., None] & (layout.counts[kids] > 0), kids, null)
-        chosen = chosen.scatter(-1, picked, False).scatter(-1, kids.flatten(-2), True)
-        chosen[..., null] = False
-
     order = (~chosen).to(torch.int8).argsort(dim=-1, stable=True)[..., :n_slots]  # chosen cells first
     used = torch.arange(n_slots, device=errors.device) < chosen.sum(-1, keepdim=True)
     return torch.where(used, order, null)
+
+
+def _tree_cells(
+    pyramid: Pyramid, queries: Tensor, weights: Tensor, prefix_keys: Tensor, score: str, n_slots: int
+) -> Tensor:
+    """Tree order's scoring pass and selection, in one function so torch.compile can fuse their small kernels."""
+    return _select_tree(pyramid, cell_errors(pyramid, queries, weights, prefix_keys, score), n_slots)
+
+
+_tree_cells_compiled = torch.compile(_tree_cells)
 
 
 class FoveatedAttention(nn.Module):

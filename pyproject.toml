@@ -15,6 +15,7 @@ classifiers = [
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
+    "datasets>=5.1.0",
     "ftfy>=6.3.1",
     "iopath>=0.1.10",
     "omegaconf>=2.4.0",

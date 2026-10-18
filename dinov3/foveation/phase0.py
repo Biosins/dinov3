@@ -43,12 +43,16 @@ IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 ARCHS = ["vits16", "vits16plus", "vitb16", "vitl16", "vitl16plus", "vith16plus", "vit7b16"]
 
 
+def patch_aligned_size(height: int, width: int, long_side: int, patch_size: int) -> list[int]:
+    """The size with a long side of about `long_side` pixels, both sides multiples of the patch size."""
+    scale = long_side / max(height, width)
+    return [max(1, round(side * scale / patch_size)) * patch_size for side in (height, width)]
+
+
 def resize_image(path: Path, long_side: int, patch_size: int) -> Tensor:
-    """uint8 image resized so the long side is about `long_side` pixels and both sides are multiples of the patch
-    size."""
+    """uint8 image resized to its patch-aligned size."""
     image = decode_image(str(path), mode=ImageReadMode.RGB)
-    scale = long_side / max(image.shape[-2:])
-    size = [max(1, round(side * scale / patch_size)) * patch_size for side in image.shape[-2:]]
+    size = patch_aligned_size(*image.shape[-2:], long_side, patch_size)
     return v2.functional.resize(image, size, interpolation=v2.InterpolationMode.BICUBIC, antialias=True)
 
 

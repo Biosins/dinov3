@@ -13,6 +13,7 @@ Example:
 
 import argparse
 import copy
+from typing import Callable
 
 import pandas as pd
 import torch
@@ -57,10 +58,13 @@ def flops(model: DinoVisionTransformer, H: int, W: int, config: FoveationConfig 
     return dict(attention_tflops=depth * attention / 1e12, per_token_tflops=depth * per_token / 1e12)
 
 
-def measure(model: DinoVisionTransformer, x: torch.Tensor, dtype: torch.dtype, min_run_time: float) -> dict:
+def measure(run: Callable[[torch.Tensor], object], x: torch.Tensor, dtype: torch.dtype, min_run_time: float) -> dict:
+    """Median time and peak activation memory of `run(x)`, e.g. a model's forward_features, plus the GPU time of
+    each foveation stage."""
+
     def forward():
         with torch.inference_mode(), torch.autocast("cuda", dtype=dtype, enabled=dtype != torch.float32):
-            model.forward_features(x)
+            run(x)
 
     forward()  # warm up kernels and caches
     torch.cuda.synchronize()
@@ -105,7 +109,10 @@ def main():
         x = make_base_transform()(image)[None].cuda()
         common = dict(size=size, patches=f"{W}x{H}", dtype=args.dtype)
         rows.append(
-            common | dict(model="dense") | flops(dense, H, W, None) | measure(dense, x, dtype, args.min_run_time)
+            common
+            | dict(model="dense")
+            | flops(dense, H, W, None)
+            | measure(dense.forward_features, x, dtype, args.min_run_time)
         )
         for budget in args.budgets:
             level = args.start_level
@@ -119,7 +126,7 @@ def main():
                     common
                     | dict(model=name)
                     | flops(foveated, H, W, config)
-                    | measure(foveated, x, dtype, args.min_run_time)
+                    | measure(foveated.forward_features, x, dtype, args.min_run_time)
                 )
                 del foveated
                 torch.cuda.empty_cache()
