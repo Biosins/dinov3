@@ -195,7 +195,7 @@ def score(variants: list[Variant], probes: dict[str, nn.Linear], data: Segmentat
 def speed(variant: Variant, min_run_time: float) -> dict[str, float]:
     for module in variant.model.modules():
         if isinstance(module, FoveatedAttention):
-            module.config = replace(module.config, compile=True)
+            module.config = replace(module.config, compile="static")  # timed at one fixed size
     x = torch.randn(1, 3, *patch_aligned_size(2, 3, variant.size, ALIGN), device="cuda")
     timing = measure(variant.grid, x, torch.bfloat16, min_run_time)
     return dict(time_ms=timing["time_ms"], peak_activation_mb=timing["peak_activation_mb"])

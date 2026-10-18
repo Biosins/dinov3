@@ -214,20 +214,23 @@ def test_foveated_model_reproduces_dense_model():
 @pytest.mark.parametrize(
     "order, score, scoring", [("per_level", "detail", "full"), ("tree", "bound", "full"), ("tree", "variance", "beam")]
 )
-def test_compiled_foveation_matches_eager(layer, order, score, scoring):
+@pytest.mark.parametrize("compile", ["static", "dynamic"])
+def test_compiled_foveation_matches_eager_at_every_size(layer, order, score, scoring, compile):
+    """Compiled foveation matches eager at several image sizes; compiled dynamically, it never recompiles."""
     attn, rope = layer
     attn, rope = attn.cuda(), rope.cuda()
-    H, W = 10, 13
-    x = torch.randn(2, PREFIX + H * W, DIM, device="cuda")
-    grid = RopeGrid(patch_coords(rope, H, W), rope.periods)
     eager, compiled = (
         FoveatedAttention(
-            attn, FoveationConfig(budget=35, start_level=2, order=order, score=score, scoring=scoring, compile=flag)
+            attn, FoveationConfig(budget=35, start_level=2, order=order, score=score, scoring=scoring, compile=mode)
         )
-        for flag in (False, True)
+        for mode in (None, compile)
     )
-    with torch.no_grad():
-        torch.testing.assert_close(compiled(x, rope=grid), eager(x, rope=grid), atol=1e-5, rtol=1e-4)
+    torch._dynamo.reset()
+    for i, (H, W) in enumerate([(10, 13), (16, 21), (9, 20)]):
+        x = torch.randn(2, PREFIX + H * W, DIM, device="cuda")
+        grid = RopeGrid(patch_coords(rope, H, W), rope.periods)
+        with torch.no_grad(), torch._dynamo.config.patch(error_on_recompile=compile == "dynamic" and i > 0):
+            torch.testing.assert_close(compiled(x, rope=grid), eager(x, rope=grid), atol=1e-5, rtol=1e-4)
 
 
 def test_oracle_and_spread_criteria_vanish_on_uniform_cells(layer):

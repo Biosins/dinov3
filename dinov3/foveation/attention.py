@@ -47,9 +47,10 @@ class FoveationConfig:
     score="variance"."""
     rounds: int = 3
     """Scoring rounds for global order."""
-    compile: bool = False
-    """Compile the pyramid pooling and tree selection with torch.compile. Faster, but recompiles for every new image
-    size."""
+    compile: Literal["static", "dynamic"] | None = None
+    """Compile the pyramid pooling and tree selection with torch.compile. static: one compile per image size, the
+    fastest kernels (torch falls back to eager after 8 sizes). dynamic: dims that grow with the image are marked
+    dynamic, so one compile serves every size, about 20% slower on ViT-B."""
 
     def __post_init__(self):
         if not 0 <= self.score_level <= self.start_level:
@@ -71,13 +72,18 @@ class Layout(NamedTuple):
     level: Tensor  # [M], -1 for the null cell
     children: Tensor  # [M, 4] a cell's quadrants; splitting a fine cell keeps it and adds three null cells
     roots: Tensor  # [n0] the start-level cells
-    shapes: list[tuple[int, int]]  # grid size of each level, fine first; level l cells are 2**l patches wide
+    grids: list[Tensor]  # [H_l, W_l] cell indices of each level, fine first; level l cells are 2**l patches wide
     cell_rope: tuple[Tensor, Tensor]  # RoPE sin and cos [M, d] at each cell's centroid
     patch_rope: tuple[Tensor, Tensor]  # RoPE sin and cos [H * W, d] at each patch centre
 
+    @property
+    def shapes(self) -> list[torch.Size]:
+        """Grid size of each level. Read from tensors, so torch.compile can keep them symbolic."""
+        return [grid.shape for grid in self.grids]
+
     def level_cells(self, level: int) -> slice:
-        start = sum(h * w for h, w in self.shapes[:level])
-        return slice(start, start + self.shapes[level][0] * self.shapes[level][1])
+        start = sum(grid.numel() for grid in self.grids[:level])
+        return slice(start, start + self.grids[level].numel())
 
 
 class RopeGrid(NamedTuple):
@@ -187,10 +193,27 @@ def pyramid_layout(grid: RopeGrid, levels: int) -> Layout:
         level=level,
         children=torch.cat([leaf_children, *quadrants, torch.full_like(leaf_children[:1], null)]),
         roots=flat_ids[-1],
-        shapes=shapes,
+        grids=grids,
         cell_rope=rope_sincos(coords, grid.periods),
         patch_rope=rope_sincos(grid.coords.flatten(0, 1), grid.periods),
     )
+
+
+def _image_sized(x: Tensor, *dims: int) -> Tensor:
+    """Marks dims that grow with the image as dynamic for compile="dynamic", so one compiled graph serves every
+    image size while the budget, heads and head width stay static."""
+    for dim in dims:
+        torch._dynamo.maybe_mark_dynamic(x, dim)
+    return x
+
+
+def _image_sized_layout(layout: Layout) -> Layout:
+    """Marks every cell and patch dim of the layout dynamic (see _image_sized)."""
+    for x in (layout.counts, layout.level, layout.children, layout.roots, *layout.cell_rope, *layout.patch_rope):
+        _image_sized(x, 0)
+    for grid in layout.grids:
+        _image_sized(grid, 0, 1)
+    return layout
 
 
 def cell_sums(x: Tensor, levels: int) -> Tensor:
@@ -224,8 +247,9 @@ def _pool_features(
     return _rotate(queries, score_rope), _rotate(keys, layout.cell_rope), values, spread
 
 
-# One compile per image size: the layout's shapes are Python ints, so dynamic shapes would recompile anyway
-_pool_features_compiled = torch.compile(_pool_features, dynamic=False)
+_pool_features_compiled = dict(
+    static=torch.compile(_pool_features, dynamic=False), dynamic=torch.compile(_pool_features)
+)
 
 
 def build_pyramid(
@@ -235,16 +259,23 @@ def build_pyramid(
     grid: RopeGrid,
     levels: int,
     score_level: int | None = None,
-    compile: bool = False,
+    compile: Literal["static", "dynamic"] | None = None,
 ) -> Pyramid:
     """Mean-pools patch keys and values [B, h, H, W, d] into a quadtree `levels` levels deep, and queries to
     `score_level` (default: `levels`). Uses grid's precomputed layout when it has one."""
     score_level = levels if score_level is None else score_level
     layout = grid.layout if grid.layout is not None else pyramid_layout(grid, levels)
     assert len(layout.shapes) == levels + 1, "the grid's layout was built for a different start level"
-    pool = _pool_features_compiled if compile else _pool_features
+    if compile == "dynamic":
+        q, k, v = (_image_sized(t, 2, 3) for t in (q, k, v))
+        layout = _image_sized_layout(layout)
+    pool = _pool_features_compiled[compile] if compile else _pool_features
     queries, keys, values, spread = pool(q, k, v, layout, levels, score_level)
-    return Pyramid(queries, layout.counts[layout.level_cells(score_level)], keys, values, spread, layout)
+    query_counts = layout.counts[layout.level_cells(score_level)]
+    if compile == "dynamic":  # these feed the compiled tree selection
+        queries, keys, values, spread = (_image_sized(t, 2) for t in (queries, keys, values, spread))
+        query_counts = _image_sized(query_counts, 0)
+    return Pyramid(queries, query_counts, keys, values, spread, layout)
 
 
 def _spare_splits(roots: int, budget: int) -> int:
@@ -318,8 +349,14 @@ def select_cells(
     if config.order == "uniform":
         return roots
     if config.order == "tree":
-        tree_cells = _tree_cells_compiled if config.compile else _tree_cells
-        return tree_cells(pyramid, queries, weights, prefix_keys, config, n_slots)
+        if config.compile is None:
+            return _tree_cells(pyramid, queries, weights, prefix_keys, config, n_slots)
+        if config.compile == "dynamic":
+            queries, weights = _image_sized(queries, 2), _image_sized(weights, 0)
+        # prefix_keys is a view into all keys, so its strides change with the image size: a copy keeps them fixed
+        return _tree_cells_compiled[config.compile](
+            pyramid, queries, weights, prefix_keys.contiguous(), config, n_slots
+        )
     if config.order == "global":
         cells = _select_global(pyramid, roots, scores, n_slots, config.rounds)
     else:
@@ -358,13 +395,13 @@ def _select_global(pyramid: Pyramid, roots: Tensor, scores, n_slots: int, rounds
 
 
 def cell_errors(
-    pyramid: Pyramid, queries: Tensor, weights: Tensor, prefix_keys: Tensor, score: str, chunk_scores: int = 2**25
+    pyramid: Pyramid, queries: Tensor, weights: Tensor, prefix_keys: Tensor, score: str, chunks: int = 4
 ) -> Tensor:
     """Estimated output error [B, h, M] from leaving each cell pooled, for every cell at once.
 
     The scoring queries attend once to the CLS and register tokens plus every fine key; each patch's attention (and
     its query-norm-weighted attention) is then summed up the pyramid, so a cell's mass is the sum of its children's.
-    Queries go in chunks of about `chunk_scores` attention scores, to bound memory.
+    Queries go in a fixed number of chunks, which bounds memory and keeps the loop the same for every image size.
     """
     layout, d, n_prefix = pyramid.layout, queries.shape[-1], prefix_keys.shape[2]
     fine = layout.level_cells(0)
@@ -372,11 +409,13 @@ def cell_errors(
     # In the queries' precision: a float32 bias would promote every [chunk, N] score matrix to float32
     bias = F.pad(layout.counts[fine].log(), (n_prefix, 0)).to(queries.dtype)
     stats = torch.stack([weights.expand(queries.shape[:3]), weights * queries.norm(dim=-1)], dim=-1)  # [B, h, Q, 2]
+    # Padding to a multiple of the chunks, with queries of zero weight, keeps every chunk the same size
+    pad = (0, 0, 0, -queries.shape[2] % chunks)
+    queries, stats = (F.pad(t, pad).unflatten(2, (chunks, -1)).unbind(2) for t in (queries, stats))
     per_patch = 0
-    chunk = max(1, chunk_scores // (queries.shape[0] * queries.shape[1] * keys.shape[2]))
-    for rows in torch.arange(queries.shape[2], device=queries.device).split(chunk):
-        probs = (queries[:, :, rows] @ keys.mT * d**-0.5 + bias).softmax(-1)[..., n_prefix:]
-        per_patch = per_patch + (probs.mT @ stats[:, :, rows].to(probs.dtype)).float()  # [B, h, N', 2]
+    for chunk, chunk_stats in zip(queries, stats):
+        probs = (chunk @ keys.mT * d**-0.5 + bias).softmax(-1)[..., n_prefix:]
+        per_patch = per_patch + (probs.mT @ chunk_stats.to(probs.dtype)).float()  # [B, h, N', 2]
     mass, q_mass = cell_sums(per_patch.unflatten(2, layout.shapes[0]), len(layout.shapes) - 1).unbind(-1)
     errors = dict(
         attention=lambda: mass,
@@ -443,7 +482,7 @@ def beam_errors(
         quads = layout.children[parents]  # all null for the null cell
         quads[..., 0] = torch.where(expand, quads[..., 0], picked)  # so picks that are not expanded stay put
         cells = torch.cat([cells.scatter(-1, best.indices, quads[..., 0]), quads[..., 1:].flatten(-2)], dim=-1)
-    errors[..., null], splittable[..., null] = 0, False
+    errors[..., -1], splittable[..., -1] = 0, False  # the null cell; -1 keeps the index static
     return errors, splittable
 
 
@@ -555,7 +594,7 @@ def _tree_cells(
     return _select_tree(pyramid, cell_errors(pyramid, queries, weights, prefix_keys, config.score), n_slots)
 
 
-_tree_cells_compiled = torch.compile(_tree_cells, dynamic=False)
+_tree_cells_compiled = dict(static=torch.compile(_tree_cells, dynamic=False), dynamic=torch.compile(_tree_cells))
 
 
 class FoveatedAttention(nn.Module):

@@ -123,7 +123,7 @@ def main():
             level = args.start_level
             while start_cells(H, W, level) > budget // 2:
                 level += 1
-            for compile in (False, True):
+            for compile in (None, "static"):
                 config = FoveationConfig(budget=budget, start_level=level, score_level=level, compile=compile)
                 foveated = foveate(copy.deepcopy(dense), config)
                 name = f"foveated K={budget}, {dense.patch_size * 2**level}px start" + (", compiled" if compile else "")
